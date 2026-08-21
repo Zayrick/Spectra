@@ -1,0 +1,17 @@
+[package]
+name = "rgb-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+hidapi = { version = "2.6.6", default-features = false }
+iced = { version = "0.14.0", features = ["svg", "tokio"] }
+mlua = { version = "0.12.0", features = ["lua55", "vendored", "send"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+hidapi = { version = "2.6.6", default-features = false, features = ["linux-native-basic-udev"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+hidapi = { version = "2.6.6", default-features = false, features = ["windows-native"] }
