@@ -17,7 +17,7 @@ impl LuaPluginRuntime {
     pub fn load(metadata: &PluginMetadata, hid: Option<&HidManager>) -> Result<Self> {
         ensure!(
             (metadata.plugin_type == PluginType::Device) == hid.is_some(),
-            "只有 device runtime 可以获得 @rgb/hidapi"
+            "只有 device runtime 可以获得 @Spectra/hidapi"
         );
         let source = fs::read_to_string(&metadata.path)
             .with_context(|| format!("读取插件 {} 失败", metadata.path.display()))?;
@@ -63,9 +63,9 @@ impl LuaPluginRuntime {
 fn install_require(lua: &Lua, hid: Option<&HidManager>) -> Result<()> {
     let hid = hid.map(|hid| hid.lua_module(lua)).transpose()?;
     let require = lua.create_function(move |_, name: String| {
-        if name == "@rgb/hidapi" {
+        if name == "@Spectra/hidapi" {
             return hid.clone().ok_or_else(|| {
-                mlua::Error::RuntimeError("@rgb/hidapi 在这个 runtime 中不可用".into())
+                mlua::Error::RuntimeError("@Spectra/hidapi 在这个 runtime 中不可用".into())
             });
         }
         Err(mlua::Error::RuntimeError(format!("未知 module {name:?}")))
@@ -84,7 +84,7 @@ mod tests {
         let lua = Lua::new();
         install_require(&lua, None).unwrap();
         let error = lua
-            .load("return require('@rgb/hidapi')")
+            .load("return require('@Spectra/hidapi')")
             .eval::<Value>()
             .unwrap_err();
         assert!(error.to_string().contains("不可用"));

@@ -1,4 +1,4 @@
-# rgb-core Lua 插件 API（v0）
+# Lua 插件 API（v0）
 
 本文描述当前原型 ABI。Lua 版本固定为 5.5；一个 Lua 文件返回一个 module table。
 
@@ -59,7 +59,7 @@ device 插件至少需要一个：
 ### module 生命周期
 
 ```lua
-local hid = require("@rgb/hidapi")
+local hid = require("@Spectra/hidapi")
 local plugin = {}
 
 function plugin.discover(hids)
@@ -109,7 +109,7 @@ return plugin
 | `matrix` | table | 必填；设备 LED 矩阵 |
 | `data` | binary string/nil | 可选；内核按不透明数据保存，启动时原样交回脚本；缺省为 `id` |
 
-脚本可以根据 HID 描述字段完成验证，也可以通过 `@rgb/hidapi` 做协议探测；探测期间打开
+脚本可以根据 HID 描述字段完成验证，也可以通过 `@Spectra/hidapi` 做协议探测；探测期间打开
 的临时句柄应在 `discover()` 返回前关闭。某个插件的 `discover()` 抛错会使本次扫描失败。
 一个插件可注册零到多个逻辑设备，注册项可按需组合 HID collection。
 
@@ -168,7 +168,7 @@ local matrix = {
 - `matrix.leds`：按 `cells` 从上到下、从左到右排列的紧凑数组，每项包含 `id`、可选
   `name`、`x`、`y`；effect 返回值和 device 收到的 RGB bytes 都使用这个顺序。
 
-### `@rgb/hidapi`
+### `@Spectra/hidapi`
 
 device runtime 提供此 module。
 

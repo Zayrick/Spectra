@@ -1,9 +1,9 @@
 ---@plugin Spatial Rainbow
 ---@plugin-type effect
----@author rgb-core contributors
+---@author Contributors
 ---@version 1.0.0
 ---@license MIT
----@source https://github.com/yourname/rgb-core
+---@source bundled
 ---@description 根据设备矩阵坐标渲染并持续移动的全设备彩虹
 
 local effect = {}

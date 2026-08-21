@@ -1,6 +1,6 @@
-# rgb-core
+# Spectra
 
-`rgb-core` 是一个跨平台 RGB 基础设施原型。Rust 内核只负责插件发现、Lua runtime、
+`Spectra` 是一个跨平台 RGB 基础设施原型。Rust 内核只负责插件发现、Lua runtime、
 HID capability、矩阵/颜色路由、60 Hz 调度和 iced GUI；设备支持与灯效由单文件 Lua 5.5
 插件提供。
 
@@ -19,11 +19,11 @@ HID capability、矩阵/颜色路由、60 Hz 调度和 iced GUI；设备支持�
                                                         ▼
 设备运行 Lua VM <──紧凑 RGB bytes── Rust 内核 <──60 Hz worker── 灯效 Lua VM
       │                                                        （矩阵/时间上下文）
-      └── require("@rgb/hidapi") ──> hidapi ──> HID device
+      └── require("@Spectra/hidapi") ──> hidapi ──> HID device
 ```
 
 每次设备发现以及每个已启动插件都使用独立的 Lua 5.5 VM 和 module cache。设备发现和
-运行 runtime 可通过 `require("@rgb/hidapi")` 获取 HID API；灯效 runtime 接收矩阵和
+运行 runtime 可通过 `require("@Spectra/hidapi")` 获取 HID API；灯效 runtime 接收矩阵和
 时间组成的渲染上下文。
 
 ## 运行

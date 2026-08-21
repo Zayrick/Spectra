@@ -1,5 +1,5 @@
 [package]
-name = "rgb-core"
+name = "spectra"
 version = "0.1.0"
 edition = "2024"
 

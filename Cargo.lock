@@ -2743,17 +2743,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rgb-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "hidapi",
- "iced",
- "mlua",
-]
-
-[[package]]
 name = "roxmltree"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3112,6 +3101,17 @@ dependencies = [
  "web-sys",
  "windows-sys 0.61.2",
  "x11rb",
+]
+
+[[package]]
+name = "spectra"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hidapi",
+ "iced",
+ "mlua",
 ]
 
 [[package]]

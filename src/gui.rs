@@ -32,7 +32,7 @@ pub fn run(catalog: PluginCatalog, hid: HidManager) -> iced::Result {
     let boot = move || App::new(catalog.clone(), hid.clone());
 
     iced::application(boot, App::update, App::view)
-        .title("rgb-core")
+        .title("Spectra")
         .theme(Theme::TokyoNightStorm)
         .subscription(App::subscription)
         .window(main_window_settings())
@@ -523,7 +523,7 @@ impl App {
 }
 
 fn title_bar<'a>() -> Element<'a, Message> {
-    let title = text("Sceptre").size(13);
+    let title = text("Spectra").size(13);
 
     let drag_area = mouse_area(
         container(title)

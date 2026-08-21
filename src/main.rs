@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 
-use rgb_core::hid::HidManager;
-use rgb_core::plugin::{PluginCatalog, PluginType};
+use spectra::hid::HidManager;
+use spectra::plugin::{PluginCatalog, PluginType};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "rgb-core",
+    name = "spectra",
     version,
     about = "由独立 Lua 5.5 插件驱动的跨平台 RGB 内核"
 )]
@@ -60,7 +60,7 @@ fn main() -> Result<()> {
     }
 
     let hid = HidManager::new()?;
-    rgb_core::gui::run(catalog, hid)?;
+    spectra::gui::run(catalog, hid)?;
     Ok(())
 }
 
