@@ -7,6 +7,7 @@ HID capability、矩阵/颜色路由、60 Hz 调度和 iced GUI；设备支持�
 当前随仓库提供：
 
 - `plugins/effects/rainbow.lua`：根据任意设备矩阵坐标渲染的空间彩虹。
+- `plugins/effects/hypnotic_plasma.lua`：以多层正弦波渲染流动的高饱和度等离子色彩。
 
 ## 数据流
 

@@ -27,6 +27,14 @@ impl ActiveEffect {
             metadata.name
         );
         let runtime = LuaPluginRuntime::load(metadata, None)?;
+        Self::start_with_runtime(metadata, matrix, runtime)
+    }
+
+    fn start_with_runtime(
+        metadata: &PluginMetadata,
+        matrix: &DeviceMatrix,
+        runtime: LuaPluginRuntime,
+    ) -> Result<Self> {
         let matrix_table = matrix.to_lua(&runtime.lua)?;
         let context = effect_context(&runtime.lua, matrix_table.clone(), 0.0, 0.0, 0)?;
         let state = match runtime.optional_function("start")? {
@@ -148,19 +156,39 @@ fn effect_context(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::path::PathBuf;
 
     use super::*;
     use crate::types::{Led, LedId};
 
-    fn bundled_effect() -> ActiveEffect {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("plugins")
-            .join("effects")
-            .join("rainbow.lua");
-        let source = fs::read_to_string(&path).unwrap();
-        let metadata = PluginMetadata::parse(&path, &source).unwrap();
+    const EFFECT_SOURCE: &str = r#"
+local effect = {}
+
+function effect.start(context)
+    return { color_bytes = #context.matrix.leds * 3 }
+end
+
+function effect.render(state, context)
+    return string.rep(string.char(context.frame % 256), state.color_bytes)
+end
+
+return effect
+"#;
+
+    fn test_effect() -> ActiveEffect {
+        let metadata = PluginMetadata {
+            id: "test_effect".into(),
+            name: "Test Effect".into(),
+            plugin_type: PluginType::Effect,
+            author: "Test".into(),
+            version: "1.0.0".into(),
+            license: "MIT".into(),
+            source: "test".into(),
+            description: "Test effect".into(),
+            hid: Vec::new(),
+            path: PathBuf::from("embedded-test-effect"),
+        };
+        let runtime = LuaPluginRuntime::from_test_source(&metadata, EFFECT_SOURCE).unwrap();
         let id = LedId::Integer(0);
         let matrix = DeviceMatrix {
             width: 1,
@@ -173,29 +201,29 @@ mod tests {
                 y: 0,
             }],
         };
-        ActiveEffect::start(&metadata, &matrix).unwrap()
+        ActiveEffect::start_with_runtime(&metadata, &matrix, runtime).unwrap()
     }
 
     #[test]
-    fn bundled_rainbow_renders() {
-        let effect = bundled_effect();
+    fn embedded_effect_renders() {
+        let effect = test_effect();
         let stopped = Arc::new(AtomicBool::new(false));
         let frame = effect
             .render(
                 0.0,
                 0.0,
-                0,
+                7,
                 Instant::now() + std::time::Duration::from_secs(1),
                 &stopped,
             )
             .unwrap()
             .unwrap();
-        assert_eq!(frame.len(), 3);
+        assert_eq!(frame, vec![7, 7, 7]);
     }
 
     #[test]
     fn slow_render_is_dropped_at_its_deadline() {
-        let effect = bundled_effect();
+        let effect = test_effect();
         let render = effect
             .runtime
             .lua

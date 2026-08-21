@@ -43,6 +43,11 @@ impl LuaPluginRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn from_test_source(metadata: &PluginMetadata, source: &str) -> Result<Self> {
+        Self::from_source(metadata, source, None)
+    }
+
+    #[cfg(test)]
     pub fn module(&self) -> Table {
         self.module.clone()
     }
