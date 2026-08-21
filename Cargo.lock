@@ -3108,10 +3108,14 @@ name = "spectra"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "block2 0.5.1",
  "clap",
  "hidapi",
  "iced",
  "mlua",
+ "objc2 0.5.2",
+ "objc2-app-kit 0.2.2",
+ "objc2-foundation 0.2.2",
 ]
 
 [[package]]

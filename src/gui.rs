@@ -1,11 +1,38 @@
+#[cfg(not(target_os = "macos"))]
 use std::sync::LazyLock;
 use std::time::Duration;
-
-use iced::alignment::{Horizontal, Vertical};
-use iced::widget::{
-    button, column, container, mouse_area, pane_grid, row, rule, scrollable, svg, text, tooltip,
+#[cfg(target_os = "macos")]
+use std::{
+    cell::{Cell, RefCell},
+    ptr::NonNull,
+    rc::Rc,
+    sync::{Mutex, OnceLock},
 };
-use iced::{Background, Border, Element, Length, Size, Subscription, Task, Theme, time, window};
+
+#[cfg(target_os = "macos")]
+use block2::RcBlock;
+use iced::alignment::{Horizontal, Vertical};
+#[cfg(target_os = "macos")]
+use iced::futures::channel::mpsc::{self, UnboundedSender};
+use iced::widget::{button, column, container, mouse_area, pane_grid, row, rule, scrollable, text};
+#[cfg(not(target_os = "macos"))]
+use iced::widget::{svg, tooltip};
+#[cfg(target_os = "macos")]
+use iced::window::raw_window_handle::RawWindowHandle;
+use iced::{
+    Background, Border, Element, Length, Padding, Size, Subscription, Task, Theme, time, window,
+};
+#[cfg(target_os = "macos")]
+use objc2::rc::Retained;
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{
+    NSView, NSWindow, NSWindowButton, NSWindowDidUpdateNotification,
+    NSWindowWillEnterFullScreenNotification, NSWindowWillExitFullScreenNotification,
+};
+#[cfg(target_os = "macos")]
+use objc2_foundation::{
+    NSNotification, NSNotificationCenter, NSNotificationName, NSObject, NSPoint,
+};
 
 use crate::engine::Pipeline;
 use crate::hid::HidManager;
@@ -19,12 +46,28 @@ const DEFAULT_SIDEBAR_RATIO: f32 = 200.0 / WINDOW_SIZE.width;
 const DEVICE_INFO_HEIGHT: f32 = 180.0;
 const EFFECT_DETAIL_WIDTH: f32 = 260.0;
 const TITLE_BAR_HEIGHT: f32 = 42.0;
+const TITLE_BAR_LEADING_PADDING: f32 = 14.0;
+const MACOS_WINDOWED_TITLE_BAR_LEADING_PADDING: f32 = 87.0;
+#[cfg(target_os = "macos")]
+const MACOS_WINDOW_CONTROL_OFFSET: f64 = 5.0;
+#[cfg(not(target_os = "macos"))]
 const WINDOW_CONTROL_ICON_SIZE: f32 = 18.0;
 
+#[cfg(target_os = "macos")]
+static MACOS_WINDOW_EVENT_SENDER: OnceLock<Mutex<Option<UnboundedSender<bool>>>> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    static MACOS_WINDOW_OBSERVERS: RefCell<Option<MacOSWindowObservers>> = const { RefCell::new(None) };
+}
+
+#[cfg(not(target_os = "macos"))]
 static MINIMIZE_ICON: LazyLock<svg::Handle> =
     LazyLock::new(|| svg::Handle::from_memory(include_bytes!("assets/svg/window-min.svg")));
+#[cfg(not(target_os = "macos"))]
 static MAXIMIZE_ICON: LazyLock<svg::Handle> =
     LazyLock::new(|| svg::Handle::from_memory(include_bytes!("assets/svg/window-max.svg")));
+#[cfg(not(target_os = "macos"))]
 static CLOSE_ICON: LazyLock<svg::Handle> =
     LazyLock::new(|| svg::Handle::from_memory(include_bytes!("assets/svg/window-close.svg")));
 
@@ -49,6 +92,18 @@ fn main_window_settings() -> window::Settings {
         ..window::Settings::default()
     };
 
+    #[cfg(target_os = "macos")]
+    let settings = {
+        let mut settings = settings;
+        // Native traffic lights require a titled AppKit window. Extending the
+        // content through its transparent title bar keeps the unified frame.
+        settings.decorations = true;
+        settings.platform_specific.title_hidden = true;
+        settings.platform_specific.titlebar_transparent = true;
+        settings.platform_specific.fullsize_content_view = true;
+        settings
+    };
+
     #[cfg(target_os = "windows")]
     let settings = {
         let mut settings = settings;
@@ -69,6 +124,7 @@ struct App {
     workspace: pane_grid::State<WorkspacePane>,
     pipeline: Option<Pipeline>,
     window_id: Option<window::Id>,
+    fullscreen: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -86,10 +142,14 @@ enum Message {
     AutoRescan,
     PipelineStatus,
     WindowOpened(window::Id),
+    #[cfg(target_os = "macos")]
+    MacOSFullscreenChanged(bool),
     DragWindow,
     ToggleMaximize,
+    #[cfg(not(target_os = "macos"))]
     MinimizeWindow,
     ShowWindowMenu,
+    #[cfg(not(target_os = "macos"))]
     CloseWindow,
     CloseRequested(window::Id),
 }
@@ -124,6 +184,7 @@ impl App {
             workspace,
             pipeline: None,
             window_id: None,
+            fullscreen: false,
         }
     }
 
@@ -139,13 +200,19 @@ impl App {
             Message::PipelineStatus => self.poll_pipeline(),
             Message::WindowOpened(window) => {
                 self.window_id = Some(window);
+                #[cfg(target_os = "macos")]
+                return install_macos_window_observers(window);
             }
+            #[cfg(target_os = "macos")]
+            Message::MacOSFullscreenChanged(fullscreen) => self.fullscreen = fullscreen,
             Message::DragWindow => return self.window_task(window::drag),
             Message::ToggleMaximize => return self.window_task(window::toggle_maximize),
+            #[cfg(not(target_os = "macos"))]
             Message::MinimizeWindow => {
                 return self.window_task(|window| window::minimize(window, true));
             }
             Message::ShowWindowMenu => return self.window_task(window::show_system_menu),
+            #[cfg(not(target_os = "macos"))]
             Message::CloseWindow => return self.close_window(self.window_id),
             Message::CloseRequested(window) => return self.close_window(Some(window)),
         }
@@ -158,6 +225,8 @@ impl App {
             window::open_events().map(Message::WindowOpened),
             window::close_requests().map(Message::CloseRequested),
         ];
+        #[cfg(target_os = "macos")]
+        subscriptions.push(macos_window_events().map(Message::MacOSFullscreenChanged));
         if self.pipeline.is_some() {
             subscriptions.push(time::every(STATUS_INTERVAL).map(|_| Message::PipelineStatus));
         }
@@ -169,6 +238,8 @@ impl App {
     }
 
     fn close_window(&mut self, window: Option<window::Id>) -> Task<Message> {
+        #[cfg(target_os = "macos")]
+        remove_macos_window_observers();
         let _ = self.stop_pipeline();
         window.map(window::close).unwrap_or_else(Task::none)
     }
@@ -184,7 +255,7 @@ impl App {
         .min_size(176)
         .on_resize(8, Message::WorkspaceResized);
 
-        column![title_bar(), rule::horizontal(1), workspace]
+        column![title_bar(self.fullscreen), rule::horizontal(1), workspace]
             .spacing(0)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -522,41 +593,243 @@ impl App {
     }
 }
 
-fn title_bar<'a>() -> Element<'a, Message> {
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct MacOSWindowControlPositions {
+    standard: [NSPoint; 3],
+    windowed: [NSPoint; 3],
+}
+
+#[cfg(target_os = "macos")]
+struct MacOSWindowObservers {
+    center: Retained<NSNotificationCenter>,
+    observers: Vec<Retained<NSObject>>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacOSWindowObservers {
+    fn drop(&mut self) {
+        for observer in &self.observers {
+            // SAFETY: These are the opaque observer tokens returned by this
+            // notification center and are removed on AppKit's main thread.
+            unsafe { self.center.removeObserver(observer) };
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_window_events() -> Subscription<bool> {
+    Subscription::run(macos_window_event_stream)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_window_event_stream() -> impl iced::futures::Stream<Item = bool> {
+    let (sender, receiver) = mpsc::unbounded();
+    if let Ok(mut active_sender) = MACOS_WINDOW_EVENT_SENDER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *active_sender = Some(sender);
+    }
+    receiver
+}
+
+#[cfg(target_os = "macos")]
+fn send_macos_fullscreen_state(fullscreen: bool) {
+    let Some(sender) = MACOS_WINDOW_EVENT_SENDER.get() else {
+        return;
+    };
+    let Ok(active_sender) = sender.lock() else {
+        return;
+    };
+    if let Some(active_sender) = active_sender.as_ref() {
+        let _ = active_sender.unbounded_send(fullscreen);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_window_observers(window_id: window::Id) -> Task<Message> {
+    window::run(window_id, |window| {
+        let Ok(window_handle) = window.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::AppKit(handle) = window_handle.as_raw() else {
+            return;
+        };
+
+        // SAFETY: The raw handle keeps this NSView valid for the callback,
+        // which iced runs synchronously on winit's macOS event-loop thread.
+        let Some(view) = (unsafe { handle.ns_view.as_ptr().cast::<NSView>().as_ref() }) else {
+            return;
+        };
+        let Some(window) = view.window() else {
+            return;
+        };
+
+        let Some(positions) = macos_window_control_positions(&window) else {
+            return;
+        };
+
+        remove_macos_window_observers();
+        set_macos_window_control_positions(&window, positions.windowed);
+
+        // SAFETY: The callback runs on AppKit's main thread and all observer
+        // tokens are removed there before the window closes.
+        let center = unsafe { NSNotificationCenter::defaultCenter() };
+        let mut observers = Vec::with_capacity(3);
+        let fullscreen = Rc::new(Cell::new(false));
+
+        {
+            let callback_window = window.clone();
+            let fullscreen = Rc::clone(&fullscreen);
+            // AppKit may lay out the title-bar hierarchy again after a
+            // resize. didUpdate runs before the window is displayed, so the
+            // windowed offset is restored without presenting an intermediate
+            // frame. Full-screen layout remains entirely system-managed.
+            observers.push(add_macos_window_observer(
+                &center,
+                &window,
+                // SAFETY: This is an AppKit notification-name constant.
+                unsafe { NSWindowDidUpdateNotification },
+                move || {
+                    if !fullscreen.get() {
+                        set_macos_window_control_positions(&callback_window, positions.windowed);
+                    }
+                },
+            ));
+        }
+
+        {
+            let callback_window = window.clone();
+            let fullscreen = Rc::clone(&fullscreen);
+            observers.push(add_macos_window_observer(
+                &center,
+                &window,
+                // SAFETY: This is an AppKit notification-name constant.
+                unsafe { NSWindowWillEnterFullScreenNotification },
+                move || {
+                    fullscreen.set(true);
+                    set_macos_window_control_positions(&callback_window, positions.standard);
+                    send_macos_fullscreen_state(true);
+                },
+            ));
+        }
+
+        {
+            let callback_window = window.clone();
+            let fullscreen = Rc::clone(&fullscreen);
+            observers.push(add_macos_window_observer(
+                &center,
+                &window,
+                // SAFETY: This is an AppKit notification-name constant.
+                unsafe { NSWindowWillExitFullScreenNotification },
+                move || {
+                    fullscreen.set(false);
+                    set_macos_window_control_positions(&callback_window, positions.windowed);
+                    send_macos_fullscreen_state(false);
+                },
+            ));
+        }
+
+        MACOS_WINDOW_OBSERVERS.with(|active_observers| {
+            *active_observers.borrow_mut() = Some(MacOSWindowObservers { center, observers });
+        });
+    })
+    .discard()
+}
+
+#[cfg(target_os = "macos")]
+fn add_macos_window_observer(
+    center: &NSNotificationCenter,
+    window: &NSWindow,
+    name: &NSNotificationName,
+    handler: impl Fn() + 'static,
+) -> Retained<NSObject> {
+    let block = RcBlock::new(move |_notification: NonNull<NSNotification>| handler());
+
+    // SAFETY: AppKit posts these notifications on the main thread. The
+    // returned token owns a copied block and is retained until explicit
+    // removal by MacOSWindowObservers.
+    unsafe {
+        center.addObserverForName_object_queue_usingBlock(Some(name), Some(window), None, &block)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_macos_window_observers() {
+    MACOS_WINDOW_OBSERVERS.with(|active_observers| {
+        active_observers.borrow_mut().take();
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn macos_window_control_positions(window: &NSWindow) -> Option<MacOSWindowControlPositions> {
+    let buttons = [
+        window.standardWindowButton(NSWindowButton::NSWindowCloseButton)?,
+        window.standardWindowButton(NSWindowButton::NSWindowMiniaturizeButton)?,
+        window.standardWindowButton(NSWindowButton::NSWindowZoomButton)?,
+    ];
+    let standard = buttons.each_ref().map(|button| button.frame().origin);
+    let windowed = buttons.each_ref().map(|button| {
+        let mut origin = button.frame().origin;
+        origin.x += MACOS_WINDOW_CONTROL_OFFSET;
+
+        // Title-bar container views can use either AppKit coordinate
+        // orientation; convert a visual downward offset accordingly.
+        let is_flipped =
+            unsafe { button.superview() }.is_some_and(|superview| superview.isFlipped());
+        origin.y += if is_flipped {
+            MACOS_WINDOW_CONTROL_OFFSET
+        } else {
+            -MACOS_WINDOW_CONTROL_OFFSET
+        };
+        origin
+    });
+
+    Some(MacOSWindowControlPositions { standard, windowed })
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_window_control_positions(window: &NSWindow, positions: [NSPoint; 3]) {
+    for (kind, position) in [
+        NSWindowButton::NSWindowCloseButton,
+        NSWindowButton::NSWindowMiniaturizeButton,
+        NSWindowButton::NSWindowZoomButton,
+    ]
+    .into_iter()
+    .zip(positions)
+    {
+        let Some(button) = window.standardWindowButton(kind) else {
+            continue;
+        };
+        if button.frame().origin == position {
+            continue;
+        }
+
+        // SAFETY: This standard button belongs to the live NSWindow and
+        // all callers run on AppKit's main thread.
+        unsafe { button.setFrameOrigin(position) };
+    }
+}
+
+fn title_bar<'a>(fullscreen: bool) -> Element<'a, Message> {
     let title = text("Spectra").size(13);
+    let leading_padding = if cfg!(target_os = "macos") && !fullscreen {
+        MACOS_WINDOWED_TITLE_BAR_LEADING_PADDING
+    } else {
+        TITLE_BAR_LEADING_PADDING
+    };
 
     let drag_area = mouse_area(
         container(title)
             .width(Length::Fill)
             .height(Length::Fixed(TITLE_BAR_HEIGHT))
-            .padding([0, 14])
+            .padding(Padding::ZERO.left(leading_padding).right(14))
             .align_y(Vertical::Center),
     )
     .on_press(Message::DragWindow)
     .on_double_click(Message::ToggleMaximize)
     .on_right_press(Message::ShowWindowMenu);
-
-    let controls = row![
-        window_control_button(
-            &MINIMIZE_ICON,
-            "最小化",
-            Message::MinimizeWindow,
-            title_bar_button_style,
-        ),
-        window_control_button(
-            &MAXIMIZE_ICON,
-            "最大化或还原",
-            Message::ToggleMaximize,
-            title_bar_button_style,
-        ),
-        window_control_button(
-            &CLOSE_ICON,
-            "关闭",
-            Message::CloseWindow,
-            close_window_button_style,
-        ),
-    ]
-    .height(Length::Fixed(TITLE_BAR_HEIGHT));
 
     let scan = container(
         button(text("扫描设备").size(11))
@@ -568,8 +841,34 @@ fn title_bar<'a>() -> Element<'a, Message> {
     .padding([0, 8])
     .align_y(Vertical::Center);
 
+    let contents = row![drag_area, scan];
+    #[cfg(not(target_os = "macos"))]
+    let contents = contents.push(
+        row![
+            window_control_button(
+                &MINIMIZE_ICON,
+                "最小化",
+                Message::MinimizeWindow,
+                title_bar_button_style,
+            ),
+            window_control_button(
+                &MAXIMIZE_ICON,
+                "最大化或还原",
+                Message::ToggleMaximize,
+                title_bar_button_style,
+            ),
+            window_control_button(
+                &CLOSE_ICON,
+                "关闭",
+                Message::CloseWindow,
+                close_window_button_style,
+            ),
+        ]
+        .height(Length::Fixed(TITLE_BAR_HEIGHT)),
+    );
+
     container(
-        row![drag_area, scan, controls]
+        contents
             .width(Length::Fill)
             .height(Length::Fixed(TITLE_BAR_HEIGHT))
             .align_y(Vertical::Center),
@@ -580,6 +879,7 @@ fn title_bar<'a>() -> Element<'a, Message> {
     .into()
 }
 
+#[cfg(not(target_os = "macos"))]
 fn window_control_button<'a>(
     icon: &svg::Handle,
     label: &'a str,
@@ -624,12 +924,14 @@ fn metadata_row<'a>(label: &'a str, value: &'a str) -> Element<'a, Message> {
     .into()
 }
 
+#[cfg(not(target_os = "macos"))]
 fn window_control_icon_style(theme: &Theme, _status: svg::Status) -> svg::Style {
     svg::Style {
         color: Some(theme.extended_palette().background.base.text),
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn title_bar_button_style(theme: &Theme, status: button::Status) -> button::Style {
     match status {
         button::Status::Hovered | button::Status::Pressed => button::background(theme, status),
@@ -637,6 +939,7 @@ fn title_bar_button_style(theme: &Theme, status: button::Status) -> button::Styl
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn close_window_button_style(theme: &Theme, status: button::Status) -> button::Style {
     match status {
         button::Status::Hovered | button::Status::Pressed => button::danger(theme, status),
