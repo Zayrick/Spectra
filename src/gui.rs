@@ -41,6 +41,7 @@ use crate::types::{ColorFrame, DeviceMatrix};
 
 const HOTPLUG_INTERVAL: Duration = Duration::from_secs(1);
 const PREVIEW_INTERVAL: Duration = Duration::from_nanos(16_666_667);
+const PIPELINE_STATUS_INTERVAL: Duration = Duration::from_millis(100);
 const WINDOW_SIZE: Size = Size::new(1040.0, 700.0);
 const MIN_WINDOW_SIZE: Size = Size::new(820.0, 600.0);
 const DEFAULT_SIDEBAR_RATIO: f32 = 200.0 / WINDOW_SIZE.width;
@@ -121,6 +122,7 @@ struct App {
     selected_effect: Option<EffectOption>,
     workspace: pane_grid::State<WorkspacePane>,
     pipeline: Option<Pipeline>,
+    preview_enabled: bool,
     window_id: Option<window::Id>,
 }
 
@@ -134,6 +136,7 @@ enum WorkspacePane {
 enum Message {
     DeviceSelected(DeviceOption),
     ToggleEffect(EffectOption),
+    TogglePreview,
     WorkspaceResized(pane_grid::ResizeEvent),
     Rescan,
     AutoRescan,
@@ -178,6 +181,7 @@ impl App {
             selected_effect,
             workspace,
             pipeline: None,
+            preview_enabled: true,
             window_id: None,
         }
     }
@@ -186,6 +190,7 @@ impl App {
         match message {
             Message::DeviceSelected(device) => self.selected_device = Some(device),
             Message::ToggleEffect(effect) => self.toggle_effect(effect),
+            Message::TogglePreview => self.preview_enabled = !self.preview_enabled,
             Message::WorkspaceResized(event) => {
                 self.workspace.resize(event.split, event.ratio);
             }
@@ -218,7 +223,12 @@ impl App {
             window::close_requests().map(Message::CloseRequested),
         ];
         if self.pipeline.is_some() {
-            subscriptions.push(time::every(PREVIEW_INTERVAL).map(|_| Message::PipelineTick));
+            let interval = if self.preview_enabled {
+                PREVIEW_INTERVAL
+            } else {
+                PIPELINE_STATUS_INTERVAL
+            };
+            subscriptions.push(time::every(interval).map(|_| Message::PipelineTick));
         }
         Subscription::batch(subscriptions)
     }
@@ -368,18 +378,23 @@ impl App {
     }
 
     fn lighting_preview<'a>(&'a self, device: &'a RegisteredDevice) -> Element<'a, Message> {
-        let frame = self
-            .pipeline
-            .as_ref()
-            .filter(|pipeline| pipeline.matches_device(device))
-            .and_then(Pipeline::current_frame);
+        let frame = self.preview_enabled.then(|| {
+            self.pipeline
+                .as_ref()
+                .filter(|pipeline| pipeline.matches_device(device))
+                .and_then(Pipeline::current_frame)
+        });
 
-        canvas(LightingPreview {
-            matrix: &device.matrix,
-            frame,
-        })
-        .width(Length::FillPortion(4))
-        .height(Length::Fill)
+        mouse_area(
+            canvas(LightingPreview {
+                matrix: &device.matrix,
+                frame: frame.flatten(),
+                enabled: self.preview_enabled,
+            })
+            .width(Length::FillPortion(4))
+            .height(Length::Fill),
+        )
+        .on_press(Message::TogglePreview)
         .into()
     }
 
@@ -895,6 +910,7 @@ fn metadata_row<'a>(label: &'a str, value: &'a str) -> Element<'a, Message> {
 struct LightingPreview<'a> {
     matrix: &'a DeviceMatrix,
     frame: Option<ColorFrame>,
+    enabled: bool,
 }
 
 impl canvas::Program<Message> for LightingPreview<'_> {
@@ -908,6 +924,10 @@ impl canvas::Program<Message> for LightingPreview<'_> {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
+        if !self.enabled {
+            return Vec::new();
+        }
+
         let palette = theme.extended_palette();
         let mut drawing = canvas::Frame::new(renderer, bounds.size());
 
