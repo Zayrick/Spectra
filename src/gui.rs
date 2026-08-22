@@ -12,7 +12,7 @@ use std::{
 use block2::RcBlock;
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{
-    button, canvas, column, container, mouse_area, pane_grid, row, rule, scrollable, text,
+    button, canvas, column, container, mouse_area, pane_grid, row, rule, scrollable, slider, text,
 };
 #[cfg(not(target_os = "macos"))]
 use iced::widget::{svg, tooltip};
@@ -36,10 +36,14 @@ use objc2_foundation::{
     NSNotification, NSNotificationCenter, NSNotificationName, NSObjectProtocol, NSPoint,
 };
 
-use crate::engine::Pipeline;
+use crate::device::apply_standalone_mode;
+use crate::engine::LivePipeline;
 use crate::hid::HidManager;
 use crate::plugin::{PluginCatalog, PluginMetadata, RegisteredDevice};
-use crate::types::{ColorFrame, DeviceMatrix};
+use crate::types::{
+    ColorFrame, DeviceMatrix, DeviceMode, ModeComponent, ModeControl, ModeSettings, ModeValue,
+    SliderRange,
+};
 
 const HOTPLUG_INTERVAL: Duration = Duration::from_secs(1);
 const PREVIEW_INTERVAL: Duration = Duration::from_millis(50);
@@ -48,7 +52,7 @@ const WINDOW_SIZE: Size = Size::new(1040.0, 700.0);
 const MIN_WINDOW_SIZE: Size = Size::new(820.0, 600.0);
 const DEFAULT_SIDEBAR_RATIO: f32 = 200.0 / WINDOW_SIZE.width;
 const DEVICE_INFO_HEIGHT: f32 = 180.0;
-const EFFECT_DETAIL_WIDTH: f32 = 260.0;
+const DETAIL_PANEL_WIDTH: f32 = 280.0;
 const TITLE_BAR_HEIGHT: f32 = 42.0;
 const TITLE_BAR_LEADING_PADDING: f32 = 14.0;
 const MACOS_TITLE_BAR_LEADING_PADDING: f32 = 87.0;
@@ -122,10 +126,28 @@ struct App {
     effects: Vec<EffectOption>,
     selected_device: Option<DeviceOption>,
     selected_effect: Option<EffectOption>,
+    control_page: ControlPage,
+    selected_mode_id: Option<String>,
+    mode_settings: Option<ModeSettings>,
     workspace: pane_grid::State<WorkspacePane>,
-    pipeline: Option<Pipeline>,
+    live_pipeline: Option<LivePipeline>,
+    mode_action_pending: bool,
+    close_after_mode_action: Option<window::Id>,
     preview_enabled: bool,
     window_id: Option<window::Id>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlPage {
+    Live,
+    Standalone,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ColorChannel {
+    Red,
+    Green,
+    Blue,
 }
 
 #[derive(Clone, Debug)]
@@ -137,12 +159,29 @@ enum WorkspacePane {
 #[derive(Clone, Debug)]
 enum Message {
     DeviceSelected(DeviceOption),
+    ControlPageSelected(ControlPage),
     ToggleEffect(EffectOption),
+    DeviceModeSelected(String),
+    ModeColorChanged {
+        control_id: String,
+        channel: ColorChannel,
+        value: u8,
+    },
+    ModeSliderChanged {
+        control_id: String,
+        value: i32,
+    },
+    ApplyDeviceMode,
+    ModeActionFinished {
+        device_name: String,
+        mode_name: String,
+        result: Result<(), String>,
+    },
     TogglePreview,
     WorkspaceResized(pane_grid::ResizeEvent),
     Rescan,
     AutoRescan,
-    PipelineTick,
+    LivePipelineTick,
     WindowOpened(window::Id),
     DragWindow,
     ToggleMaximize,
@@ -174,31 +213,72 @@ impl App {
             b: Box::new(pane_grid::Configuration::Pane(WorkspacePane::Configuration)),
         });
 
-        Self {
+        let mut app = Self {
             catalog,
             hid,
             devices,
             effects,
             selected_device,
             selected_effect,
+            control_page: ControlPage::Live,
+            selected_mode_id: None,
+            mode_settings: None,
             workspace,
-            pipeline: None,
+            live_pipeline: None,
+            mode_action_pending: false,
+            close_after_mode_action: None,
             preview_enabled: true,
             window_id: None,
-        }
+        };
+        app.reset_device_controls();
+        app
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::DeviceSelected(device) => self.selected_device = Some(device),
+            Message::DeviceSelected(device) => self.select_device(device),
+            Message::ControlPageSelected(page) => self.select_control_page(page),
             Message::ToggleEffect(effect) => self.toggle_effect(effect),
+            Message::DeviceModeSelected(mode_id) => self.select_device_mode(mode_id),
+            Message::ModeColorChanged {
+                control_id,
+                channel,
+                value,
+            } => {
+                if let Some(ModeValue::Color(color)) = self
+                    .mode_settings
+                    .as_mut()
+                    .and_then(|settings| settings.get_mut(&control_id))
+                {
+                    match channel {
+                        ColorChannel::Red => color.red = value,
+                        ColorChannel::Green => color.green = value,
+                        ColorChannel::Blue => color.blue = value,
+                    }
+                }
+            }
+            Message::ModeSliderChanged { control_id, value } => {
+                if let Some(ModeValue::Slider(current)) = self
+                    .mode_settings
+                    .as_mut()
+                    .and_then(|settings| settings.get_mut(&control_id))
+                {
+                    *current = value;
+                }
+            }
+            Message::ApplyDeviceMode => return self.apply_selected_mode(),
+            Message::ModeActionFinished {
+                device_name,
+                mode_name,
+                result,
+            } => return self.finish_mode_action(&device_name, &mode_name, result),
             Message::TogglePreview => self.preview_enabled = !self.preview_enabled,
             Message::WorkspaceResized(event) => {
                 self.workspace.resize(event.split, event.ratio);
             }
             Message::Rescan => self.rescan(true),
             Message::AutoRescan => self.rescan(false),
-            Message::PipelineTick => self.poll_pipeline(),
+            Message::LivePipelineTick => self.poll_live_pipeline(),
             Message::WindowOpened(window) => {
                 self.window_id = Some(window);
                 #[cfg(target_os = "macos")]
@@ -224,13 +304,13 @@ impl App {
             window::open_events().map(Message::WindowOpened),
             window::close_requests().map(Message::CloseRequested),
         ];
-        if self.pipeline.is_some() {
+        if self.live_pipeline.is_some() {
             let interval = if self.preview_enabled {
                 PREVIEW_INTERVAL
             } else {
                 PIPELINE_STATUS_INTERVAL
             };
-            subscriptions.push(time::every(interval).map(|_| Message::PipelineTick));
+            subscriptions.push(time::every(interval).map(|_| Message::LivePipelineTick));
         }
         Subscription::batch(subscriptions)
     }
@@ -240,9 +320,14 @@ impl App {
     }
 
     fn close_window(&mut self, window: Option<window::Id>) -> Task<Message> {
+        if self.mode_action_pending {
+            self.close_after_mode_action = window.or(self.window_id);
+            eprintln!("正在完成单机模式操作，HID 会话关闭后退出");
+            return Task::none();
+        }
         #[cfg(target_os = "macos")]
         remove_macos_window_observers();
-        let _ = self.stop_pipeline();
+        let _ = self.stop_live_pipeline();
         window.map(window::close).unwrap_or_else(Task::none)
     }
 
@@ -298,7 +383,7 @@ impl App {
     fn device_button<'a>(&'a self, device: &'a DeviceOption) -> Element<'a, Message> {
         let selected = self.selected_device.as_ref() == Some(device);
         let running = self
-            .pipeline
+            .live_pipeline
             .as_ref()
             .is_some_and(|pipeline| pipeline.matches_device(&device.0));
         let content = text(&device.0.name).size(14).width(Length::Fill);
@@ -316,7 +401,7 @@ impl App {
             column![
                 self.device_information_panel(),
                 rule::horizontal(1),
-                self.effect_workspace(),
+                self.control_workspace(),
             ]
             .spacing(0)
             .width(Length::Fill)
@@ -381,10 +466,10 @@ impl App {
 
     fn lighting_preview<'a>(&'a self, device: &'a RegisteredDevice) -> Element<'a, Message> {
         let frame = self.preview_enabled.then(|| {
-            self.pipeline
+            self.live_pipeline
                 .as_ref()
                 .filter(|pipeline| pipeline.matches_device(device))
-                .and_then(Pipeline::current_frame)
+                .and_then(LivePipeline::current_frame)
         });
 
         mouse_area(
@@ -398,6 +483,68 @@ impl App {
         )
         .on_press(Message::TogglePreview)
         .into()
+    }
+
+    fn control_workspace(&self) -> Element<'_, Message> {
+        let Some(DeviceOption(device)) = &self.selected_device else {
+            return container(
+                column![
+                    text("没有可配置的设备").size(17),
+                    text("请先从左侧选择一个设备")
+                        .size(12)
+                        .style(text::secondary),
+                ]
+                .spacing(7)
+                .align_x(Horizontal::Center),
+            )
+            .center(Length::Fill)
+            .into();
+        };
+
+        let live_available = device.capabilities.live;
+        let standalone_available = !device.capabilities.modes.is_empty();
+        let tabs = row![
+            button(text("实时").size(13))
+                .on_press_maybe(
+                    live_available.then_some(Message::ControlPageSelected(ControlPage::Live))
+                )
+                .padding([8, 18])
+                .style(|theme, status| {
+                    selectable_button_style(
+                        theme,
+                        status,
+                        self.control_page == ControlPage::Live,
+                        false,
+                    )
+                }),
+            button(text("单机").size(13))
+                .on_press_maybe(
+                    standalone_available
+                        .then_some(Message::ControlPageSelected(ControlPage::Standalone))
+                )
+                .padding([8, 18])
+                .style(|theme, status| {
+                    selectable_button_style(
+                        theme,
+                        status,
+                        self.control_page == ControlPage::Standalone,
+                        false,
+                    )
+                }),
+        ]
+        .spacing(8)
+        .padding([10, 20]);
+
+        let content = match self.control_page {
+            ControlPage::Live => self.effect_workspace(),
+            ControlPage::Standalone => self.standalone_workspace(),
+        };
+
+        column![tabs, rule::horizontal(1), content]
+            .spacing(0)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn effect_workspace(&self) -> Element<'_, Message> {
@@ -445,7 +592,11 @@ impl App {
     fn effect_button<'a>(&'a self, effect: &'a EffectOption) -> Element<'a, Message> {
         let selected = self.selected_effect.as_ref() == Some(effect);
         let running = self.effect_is_running(effect);
-        let can_toggle = self.selected_device.is_some();
+        let can_toggle = !self.mode_action_pending
+            && self
+                .selected_device
+                .as_ref()
+                .is_some_and(|device| device.0.capabilities.live);
 
         let content = text(effect.0.name.as_str()).size(15).width(Length::Fill);
 
@@ -492,7 +643,7 @@ impl App {
         };
 
         container(content)
-            .width(Length::Fixed(EFFECT_DETAIL_WIDTH))
+            .width(Length::Fixed(DETAIL_PANEL_WIDTH))
             .height(Length::Fill)
             .padding([17, 18])
             .style(effect_detail_style)
@@ -503,7 +654,7 @@ impl App {
         let Some(DeviceOption(device)) = &self.selected_device else {
             return false;
         };
-        self.pipeline.as_ref().is_some_and(|pipeline| {
+        self.live_pipeline.as_ref().is_some_and(|pipeline| {
             pipeline.matches_device(device) && pipeline.effect_name() == effect.0.name
         })
     }
@@ -512,51 +663,59 @@ impl App {
         let already_running = self.effect_is_running(&effect);
         self.selected_effect = Some(effect);
         if already_running {
-            self.stop_selected();
+            self.stop_live();
         } else {
-            self.start_selected();
+            self.start_live();
         }
     }
 
-    fn start_selected(&mut self) {
+    fn start_live(&mut self) {
         let Some(DeviceOption(device)) = self.selected_device.clone() else {
             eprintln!("没有可启动的受支持 HID 设备");
             return;
         };
+        if !device.capabilities.live {
+            eprintln!("设备 {} 不支持实时控制", device.name);
+            return;
+        }
+        if self.mode_action_pending {
+            eprintln!("单机模式操作尚未完成");
+            return;
+        }
         let Some(EffectOption(effect)) = self.selected_effect.clone() else {
             eprintln!("没有可启动的灯效插件");
             return;
         };
 
-        if let Err(error) = self.stop_pipeline() {
-            eprintln!("关闭上一条管线失败：{error:#}");
+        if let Err(error) = self.stop_live_pipeline() {
+            eprintln!("关闭上一条实时管线失败：{error:#}");
             return;
         }
 
-        match Pipeline::start(&device, &effect, &self.hid) {
+        match LivePipeline::start(&device, &effect, &self.hid) {
             Ok(pipeline) => {
                 eprintln!(
                     "已启动 {} + {}，灯效与设备均在独立 worker 中运行",
                     pipeline.device_name(),
                     pipeline.effect_name(),
                 );
-                self.pipeline = Some(pipeline);
+                self.live_pipeline = Some(pipeline);
             }
             Err(error) => eprintln!("启动失败：{error:#}"),
         }
     }
 
-    fn stop_selected(&mut self) {
-        match self.stop_pipeline() {
-            Ok(()) => eprintln!("灯效已停止，设备已关闭并尝试熄灯"),
+    fn stop_live(&mut self) {
+        match self.stop_live_pipeline() {
+            Ok(()) => eprintln!("实时灯效已停止，HID 会话已关闭"),
             Err(error) => eprintln!("停止失败：{error:#}"),
         }
     }
 
-    fn poll_pipeline(&mut self) {
-        let result = self.pipeline.as_ref().map(Pipeline::poll);
+    fn poll_live_pipeline(&mut self) {
+        let result = self.live_pipeline.as_ref().map(LivePipeline::poll);
         if let Some(Err(error)) = result {
-            let stop_error = self.stop_pipeline().err();
+            let stop_error = self.stop_live_pipeline().err();
             match stop_error {
                 Some(stop_error) => {
                     eprintln!("渲染管线已停止：{error:#}；关闭时又发生错误：{stop_error:#}")
@@ -566,14 +725,336 @@ impl App {
         }
     }
 
-    fn stop_pipeline(&mut self) -> anyhow::Result<()> {
-        match self.pipeline.take() {
+    fn stop_live_pipeline(&mut self) -> anyhow::Result<()> {
+        match self.live_pipeline.take() {
             Some(mut pipeline) => pipeline.stop(),
             None => Ok(()),
         }
     }
 
+    fn standalone_workspace(&self) -> Element<'_, Message> {
+        row![
+            self.device_mode_list_panel(),
+            rule::vertical(1),
+            self.device_mode_detail_panel(),
+        ]
+        .spacing(0)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
+    fn device_mode_list_panel(&self) -> Element<'_, Message> {
+        let list: Element<'_, Message> = match &self.selected_device {
+            Some(DeviceOption(device)) if !device.capabilities.modes.is_empty() => {
+                let mut items = column![].spacing(8).width(Length::Fill);
+                for mode in &device.capabilities.modes {
+                    items = items.push(self.device_mode_button(mode));
+                }
+                scrollable(items).height(Length::Fill).into()
+            }
+            _ => container(
+                column![
+                    text("没有单机模式").size(15),
+                    text("该设备插件没有声明设备端灯效")
+                        .size(12)
+                        .style(text::secondary),
+                ]
+                .spacing(7)
+                .align_x(Horizontal::Center),
+            )
+            .center(Length::Fill)
+            .into(),
+        };
+
+        container(list)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding([16, 20])
+            .style(effect_list_style)
+            .into()
+    }
+
+    fn device_mode_button<'a>(&'a self, mode: &'a DeviceMode) -> Element<'a, Message> {
+        let selected = self.selected_mode_id.as_deref() == Some(mode.id.as_str());
+        button(text(mode.name.as_str()).size(15).width(Length::Fill))
+            .on_press(Message::DeviceModeSelected(mode.id.clone()))
+            .width(Length::Fill)
+            .padding([13, 12])
+            .style(move |theme, status| selectable_button_style(theme, status, selected, false))
+            .into()
+    }
+
+    fn device_mode_detail_panel(&self) -> Element<'_, Message> {
+        let Some(mode) = self.selected_mode() else {
+            return container(
+                column![
+                    text("模式详情").size(11).style(text::secondary),
+                    text("暂无单机模式").size(20),
+                ]
+                .spacing(10),
+            )
+            .width(Length::Fixed(DETAIL_PANEL_WIDTH))
+            .height(Length::Fill)
+            .padding([17, 18])
+            .style(effect_detail_style)
+            .into();
+        };
+        let Some(settings) = &self.mode_settings else {
+            return container(text("模式参数状态无效"))
+                .width(Length::Fixed(DETAIL_PANEL_WIDTH))
+                .height(Length::Fill)
+                .padding([17, 18])
+                .style(effect_detail_style)
+                .into();
+        };
+
+        let mut details = column![
+            text("模式详情").size(11).style(text::secondary),
+            text(mode.name.as_str()).size(21),
+        ]
+        .spacing(12)
+        .width(Length::Fill);
+
+        if let Some(description) = &mode.description {
+            details = details.push(text(description.as_str()).size(12).style(text::secondary));
+        }
+        details = details.push(rule::horizontal(1));
+
+        for control in &mode.controls {
+            match settings.get(&control.id) {
+                Some(value) => details = details.push(self.mode_control(control, value)),
+                None => {
+                    details = details.push(
+                        text(format!("控件 {} 的状态无效", control.name))
+                            .size(11)
+                            .style(text::danger),
+                    );
+                }
+            }
+        }
+
+        let available = !self.mode_action_pending;
+        let actions = row![
+            button(text("应用").size(12))
+                .on_press_maybe(available.then_some(Message::ApplyDeviceMode))
+                .padding([8, 14])
+                .style(button::primary),
+        ]
+        .spacing(8);
+        details = details.push(rule::horizontal(1)).push(actions);
+        if !available {
+            details = details.push(text("正在写入设备…").size(11).style(text::secondary));
+        }
+
+        container(scrollable(details).height(Length::Fill))
+            .width(Length::Fixed(DETAIL_PANEL_WIDTH))
+            .height(Length::Fill)
+            .padding([17, 18])
+            .style(effect_detail_style)
+            .into()
+    }
+
+    fn mode_control<'a>(
+        &self,
+        control: &'a ModeControl,
+        value: &ModeValue,
+    ) -> Element<'a, Message> {
+        let component: Element<'a, Message> = match (&control.component, value) {
+            (ModeComponent::Slider(range), ModeValue::Slider(value)) => {
+                self.slider_control(&control.id, *range, *value)
+            }
+            (ModeComponent::Color(_), ModeValue::Color(color)) => column![
+                self.color_slider("R", &control.id, ColorChannel::Red, color.red,),
+                self.color_slider("G", &control.id, ColorChannel::Green, color.green,),
+                self.color_slider("B", &control.id, ColorChannel::Blue, color.blue,),
+            ]
+            .spacing(7)
+            .into(),
+            _ => text("控件值类型无效").size(11).style(text::danger).into(),
+        };
+
+        let mut content = column![text(control.name.as_str()).size(12)]
+            .spacing(7)
+            .width(Length::Fill);
+        if let Some(description) = &control.description {
+            content = content.push(text(description.as_str()).size(11).style(text::secondary));
+        }
+        content.push(component).into()
+    }
+
+    fn color_slider<'a>(
+        &self,
+        label: &'a str,
+        control_id: &str,
+        channel: ColorChannel,
+        value: u8,
+    ) -> Element<'a, Message> {
+        let control_id = control_id.to_owned();
+        row![
+            text(label).size(11).width(Length::Fixed(22.0)),
+            slider(0..=u8::MAX, value, move |value| Message::ModeColorChanged {
+                control_id: control_id.clone(),
+                channel,
+                value,
+            }),
+            text(value).size(11).width(Length::Fixed(34.0)),
+        ]
+        .spacing(8)
+        .align_y(Vertical::Center)
+        .into()
+    }
+
+    fn slider_control<'a>(
+        &self,
+        control_id: &str,
+        range: SliderRange,
+        value: i32,
+    ) -> Element<'a, Message> {
+        let control_id = control_id.to_owned();
+        column![
+            row![
+                text(format!("{} – {}", range.min, range.max))
+                    .size(11)
+                    .style(text::secondary)
+                    .width(Length::Fill),
+                text(value).size(11),
+            ],
+            slider(range.min..=range.max, value, move |value| {
+                Message::ModeSliderChanged {
+                    control_id: control_id.clone(),
+                    value,
+                }
+            }),
+        ]
+        .spacing(6)
+        .into()
+    }
+
+    fn select_device(&mut self, device: DeviceOption) {
+        self.selected_device = Some(device);
+        self.reset_device_controls();
+    }
+
+    fn select_control_page(&mut self, page: ControlPage) {
+        let available = self
+            .selected_device
+            .as_ref()
+            .is_some_and(|device| match page {
+                ControlPage::Live => device.0.capabilities.live,
+                ControlPage::Standalone => !device.0.capabilities.modes.is_empty(),
+            });
+        if available {
+            self.control_page = page;
+        }
+    }
+
+    fn select_device_mode(&mut self, mode_id: String) {
+        let settings = self
+            .selected_device
+            .as_ref()
+            .and_then(|device| device.0.capabilities.mode(&mode_id))
+            .map(DeviceMode::default_settings);
+        if let Some(settings) = settings {
+            self.selected_mode_id = Some(mode_id);
+            self.mode_settings = Some(settings);
+        }
+    }
+
+    fn selected_mode(&self) -> Option<&DeviceMode> {
+        let mode_id = self.selected_mode_id.as_deref()?;
+        self.selected_device.as_ref()?.0.capabilities.mode(mode_id)
+    }
+
+    fn reset_device_controls(&mut self) {
+        let Some(DeviceOption(device)) = &self.selected_device else {
+            self.control_page = ControlPage::Live;
+            self.selected_mode_id = None;
+            self.mode_settings = None;
+            return;
+        };
+
+        self.control_page = if device.capabilities.live {
+            ControlPage::Live
+        } else {
+            ControlPage::Standalone
+        };
+        let mode = device.capabilities.modes.first();
+        self.selected_mode_id = mode.map(|mode| mode.id.clone());
+        self.mode_settings = mode.map(DeviceMode::default_settings);
+    }
+
+    fn apply_selected_mode(&mut self) -> Task<Message> {
+        if self.mode_action_pending {
+            return Task::none();
+        }
+        let Some(DeviceOption(device)) = self.selected_device.clone() else {
+            eprintln!("没有可配置的设备");
+            return Task::none();
+        };
+        let Some(mode_id) = self.selected_mode_id.clone() else {
+            eprintln!("没有可应用的单机模式");
+            return Task::none();
+        };
+        let Some(settings) = self.mode_settings.clone() else {
+            eprintln!("单机模式参数无效");
+            return Task::none();
+        };
+        let Some(mode) = device.capabilities.mode(&mode_id) else {
+            eprintln!("设备不再提供所选单机模式");
+            return Task::none();
+        };
+        if let Err(error) = mode.validate_settings(&settings) {
+            eprintln!("单机模式参数无效：{error:#}");
+            return Task::none();
+        }
+        let mode_name = mode.name.clone();
+        let device_name = device.name.clone();
+
+        if let Err(error) = self.stop_live_pipeline() {
+            eprintln!("停止实时管线失败，未应用单机模式：{error:#}");
+            return Task::none();
+        }
+
+        self.mode_action_pending = true;
+        let hid = self.hid.clone();
+        Task::perform(
+            async move {
+                apply_standalone_mode(&device, &mode_id, &settings, &hid)
+                    .map_err(|error| format!("{error:#}"))
+            },
+            move |result| Message::ModeActionFinished {
+                device_name: device_name.clone(),
+                mode_name: mode_name.clone(),
+                result,
+            },
+        )
+    }
+
+    fn finish_mode_action(
+        &mut self,
+        device_name: &str,
+        mode_name: &str,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        self.mode_action_pending = false;
+        match result {
+            Ok(()) => eprintln!("已向 {device_name} 应用单机模式 {mode_name}"),
+            Err(error) => eprintln!("配置 {device_name} 的单机模式失败：{error}"),
+        }
+        match self.close_after_mode_action.take() {
+            Some(window) => self.close_window(Some(window)),
+            None => Task::none(),
+        }
+    }
+
     fn rescan(&mut self, manual: bool) {
+        if self.mode_action_pending {
+            if manual {
+                eprintln!("单机模式操作完成后才能重新扫描设备");
+            }
+            return;
+        }
         let devices = match detect_devices(&self.catalog, &self.hid) {
             Ok(devices) => devices,
             Err(error) => {
@@ -582,7 +1063,7 @@ impl App {
             }
         };
         let changed = self.devices != devices;
-        let disconnected = self.pipeline.as_ref().is_some_and(|pipeline| {
+        let disconnected = self.live_pipeline.as_ref().is_some_and(|pipeline| {
             !devices
                 .iter()
                 .any(|DeviceOption(device)| pipeline.matches_device(device))
@@ -592,11 +1073,11 @@ impl App {
 
         if disconnected {
             let name = self
-                .pipeline
+                .live_pipeline
                 .as_ref()
                 .map(|pipeline| pipeline.device_name().to_owned())
                 .unwrap_or_default();
-            let stop_error = self.stop_pipeline().err();
+            let stop_error = self.stop_live_pipeline().err();
             match stop_error {
                 Some(error) => {
                     eprintln!("设备 {name} 已拔出；停止管线时发生错误：{error:#}")
@@ -611,11 +1092,47 @@ impl App {
     }
 
     fn replace_devices(&mut self, devices: Vec<DeviceOption>) {
+        let previous_key = self
+            .selected_device
+            .as_ref()
+            .map(|device| (device.0.plugin.id.clone(), device.0.id.clone()));
+        let previous_capabilities = self
+            .selected_device
+            .as_ref()
+            .map(|device| device.0.capabilities.clone());
         let previous = self.selected_device.take();
         self.selected_device = previous
             .and_then(|selected| devices.iter().find(|device| **device == selected).cloned())
             .or_else(|| devices.first().cloned());
         self.devices = devices;
+
+        let current_key = self
+            .selected_device
+            .as_ref()
+            .map(|device| (device.0.plugin.id.clone(), device.0.id.clone()));
+        let current_capabilities = self
+            .selected_device
+            .as_ref()
+            .map(|device| &device.0.capabilities);
+        let control_valid =
+            self.selected_device
+                .as_ref()
+                .is_some_and(|device| match self.control_page {
+                    ControlPage::Live => device.0.capabilities.live,
+                    ControlPage::Standalone => !device.0.capabilities.modes.is_empty(),
+                });
+        let mode_valid = self.selected_mode_id.as_deref().is_none_or(|mode_id| {
+            self.selected_device
+                .as_ref()
+                .is_some_and(|device| device.0.capabilities.mode(mode_id).is_some())
+        });
+        if previous_key != current_key
+            || previous_capabilities.as_ref() != current_capabilities
+            || !control_valid
+            || !mode_valid
+        {
+            self.reset_device_controls();
+        }
     }
 }
 

@@ -1,8 +1,8 @@
 # Spectra
 
-`Spectra` 是一个跨平台 RGB 基础设施原型。Rust 内核只负责插件发现、Lua runtime、
-HID capability、矩阵/颜色路由、60 Hz 调度和 iced GUI；设备支持与灯效由单文件 Lua 5.5
-插件提供。
+`Spectra` 是一个跨平台 RGB 基础设施原型。Rust 内核负责插件发现、Lua runtime、
+HID capability、设备控制能力、矩阵/颜色路由、60 Hz 实时调度和 iced GUI；设备支持与
+灯效由单文件 Lua 5.5 插件提供。
 
 当前随仓库提供：
 
@@ -16,16 +16,20 @@ HID capability、矩阵/颜色路由、60 Hz 调度和 iced GUI；设备支持�
                                   │ 任一 @hid 命中时启用插件
                                   ▼
 设备发现 Lua VM ──discover(hids)──> 已注册的逻辑设备 ──> GUI
-                                                        │ 用户启动
-                                                        ▼
-设备运行 Lua VM <──紧凑 RGB bytes── Rust 内核 <──60 Hz worker── 灯效 Lua VM
-      │                                                        （矩阵/时间上下文）
-      └── require("@Spectra/hidapi") ──> hidapi ──> HID device
+                                                        ├─实时──> 60 Hz 灯效 VM
+                                                        │             │ RGB bytes
+                                                        │             ▼
+                                                        │         设备 Lua VM
+                                                        └─单机──> apply_mode
+                                                                      │
+                                                                      ▼
+                                                               hidapi ──> HID device
 ```
 
 每次设备发现以及每个已启动插件都使用独立的 Lua 5.5 VM 和 module cache。设备发现和
 运行 runtime 可通过 `require("@Spectra/hidapi")` 获取 HID API；灯效 runtime 接收矩阵和
-时间组成的渲染上下文。
+时间组成的渲染上下文。设备插件在发现阶段注册设备支持的实时控制和设备端单机模式；
+单机模式的配置控件也由插件注册，应用后由设备固件独立运行。
 
 ## 运行
 
@@ -39,9 +43,10 @@ cargo run --release
 GUI 操作：
 
 - 在左侧设备列表中选择设备；
-- 点击灯效列表中的灯效即可启动，点击正在运行的灯效即可停止管线并关闭设备；
+- 在“实时”页面点击灯效即可启动，点击正在运行的灯效即可停止管线并关闭 HID 会话；
+- 在“单机”页面选择设备端模式，使用插件为该模式声明的控件调整参数，然后应用；
 - 点击标题栏的“扫描设备”立即刷新设备列表；后台也会每秒自动扫描热插拔；
-- 关闭窗口时，应用会先停止活动管线并关闭设备。
+- 关闭窗口时，应用会先停止活动实时管线并关闭 HID 会话。
 
 解析并列出插件元数据：
 
@@ -89,18 +94,22 @@ device 插件还必须至少声明一个静态 HID 匹配项：
 
 可以写多个 `@hid`。只有 `VID:PID` 必填；`interface`、`usage-page`、`usage` 都是可选
 的触发条件。任一 `@hid` 命中后，内核调用 `plugin.discover(hids)`；脚本返回的逻辑设备
-注册项进入 GUI。设备名称、序列号、矩阵、稳定 ID 和运行时私有数据均由脚本提供。
+注册项进入 GUI。设备名称、序列号、矩阵、稳定 ID、实时能力、单机模式、模式配置控件
+和运行时私有数据均由脚本提供。
 
 完整 ABI 见 [插件 API](docs/PLUGIN_API.md)。
 
 ## 调度和路由
 
-灯效和设备各自运行在独立 worker。灯效 `render(state, context)` 以目标 60 Hz 自调度，
+实时灯效和设备各自运行在独立 worker。灯效 `render(state, context)` 以目标 60 Hz 自调度，
 返回一个按 `matrix.leds` 排列、每颗灯连续 3 个 RGB bytes 的 binary string。内核只校验
 一次字节长度；超时帧和错过的 tick 直接丢弃，不在 UI 线程补跑。设备 worker 使用单槽
 latest-frame 邮箱：设备忙时，新灯效帧覆盖尚未发送的旧帧；设备插件的 `render()` 返回
 后立即取当时最新的一帧继续发送。协议级 ready、重试和瞬时通信错误恢复由设备 Lua
 驱动自行处理，内核负责调度和帧传递。
+
+单机模式使用独立设备事务。内核停止当前实时管线后，在后台依次打开 HID 会话、应用
+插件声明的模式参数并关闭会话。
 
 ## 验证
 
@@ -113,6 +122,6 @@ cargo test --all-targets
 ## 支持范围
 
 - 设备 transport 使用 HID；
-- GUI 同时运行一台设备和一个灯效；
+- GUI 同时运行一台设备和一个实时灯效，或向一台设备应用单机模式；
 - 热插拔每秒刷新一次，拔出活动设备会停止管线；
 - Lua 插件在应用进程内分别使用独立 VM 和 worker。

@@ -85,7 +85,7 @@ mod tests {
     use mlua::Value;
 
     #[test]
-    fn effect_runtime_cannot_import_hid_capability() {
+    fn isolates_hid_capability_to_device_runtime() {
         let lua = Lua::new();
         install_require(&lua, None).unwrap();
         let error = lua

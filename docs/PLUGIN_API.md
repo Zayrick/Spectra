@@ -62,6 +62,52 @@ device 插件至少需要一个：
 local hid = require("@Spectra/hidapi")
 local plugin = {}
 
+local modes = {
+    {
+        id = "solid",                    -- 稳定 UTF-8 字符串
+        name = "Static",                 -- 显示名称
+        description = "使用固定颜色照亮所有 LED", -- 可选使用说明
+        data = "driver-private",         -- 可选二进制字符串
+        controls = {                      -- 可选配置控件数组
+            {
+                id = "primary_color",    -- 模式内唯一的配置键
+                name = "颜色",
+                description = "应用到所有 LED 的颜色", -- 可选
+                component = {
+                    type = "color",
+                    default = { red = 255, green = 255, blue = 255 },
+                },
+            },
+            {
+                id = "intensity",
+                name = "强度",
+                component = {
+                    type = "slider",
+                    min = 0,
+                    max = 100,
+                    default = 100,
+                },
+            },
+        },
+    },
+    {
+        id = "cycle",
+        name = "Spectrum Cycle",
+        controls = {
+            {
+                id = "tempo",
+                name = "变化速度",
+                component = {
+                    type = "slider",
+                    min = 0,
+                    max = 10,
+                    default = 5,
+                },
+            },
+        },
+    },
+}
+
 function plugin.discover(hids)
     local devices = {}
     for _, info in ipairs(hids) do
@@ -71,6 +117,8 @@ function plugin.discover(hids)
                 name = info.product_string or "My device", -- 必填，UTF-8 字符串
                 serial_number = info.serial_number,     -- 可选
                 matrix = build_matrix(),                -- 必填
+                live = true,                            -- 可选；支持实时帧时声明
+                modes = modes,                          -- 可选；提供单机模式时声明
                 data = info.path,                       -- 可选，二进制字符串
             }
         end
@@ -79,10 +127,11 @@ function plugin.discover(hids)
 end
 
 function plugin.open(device)
-    local handle = hid.open_path(device.data)
-    return {
-        handle = handle, -- 运行实例的私有字段可任意添加
-    }
+    return { handle = hid.open_path(device.data) }
+end
+
+function plugin.enter_live(instance)
+    -- 配置设备的 live 模式。
 end
 
 function plugin.render(instance, colors)
@@ -90,8 +139,12 @@ function plugin.render(instance, colors)
     -- 在这里映射硬件槽位、封包并调用 instance.handle:write(...)
 end
 
+function plugin.apply_mode(instance, mode, settings)
+    -- mode.id 对应 discover() 注册的模式，mode.data 是驱动私有数据。
+    -- settings.primary_color、settings.intensity 等键由 controls[].id 决定。
+end
+
 function plugin.close(instance) -- 可选
-    -- 推荐先发送全黑帧，再关闭 handle；必须允许重复清理。
     instance.handle:close()
 end
 
@@ -107,20 +160,52 @@ return plugin
 | `name` | UTF-8 string | 必填；显示给用户的设备名称 |
 | `serial_number` | UTF-8 string/nil | 可选；显示给用户的序列号 |
 | `matrix` | table | 必填；设备 LED 矩阵 |
-| `data` | binary string/nil | 可选；内核按不透明数据保存，启动时原样交回脚本；缺省为 `id` |
+| `live` | boolean/nil | 可选；设为 `true` 表示支持 Spectra 实时帧 |
+| `modes` | array/nil | 可选；设备固件执行的单机模式 |
+| `data` | binary string/nil | 可选；作为 `device.data` 传给 `open()`，缺省为 `id` |
 
 脚本可以根据 HID 描述字段完成验证，也可以通过 `@Spectra/hidapi` 做协议探测；探测期间打开
 的临时句柄应在 `discover()` 返回前关闭。某个插件的 `discover()` 抛错会使本次扫描失败。
 一个插件可注册零到多个逻辑设备，注册项可按需组合 HID collection。
 
-`open(device)` 只在用户启动一个已注册设备时调用。`device` 是该注册项的重建版本，包含
-上述全部字段；`open()` 返回插件私有的运行实例 table。设备显示信息和矩阵由
-`discover()` 的注册项确定。
+`live = true` 注册实时帧能力，非空 `modes` 注册设备端单机模式。每个设备至少注册其中
+一项，也可以同时注册两项。
 
-`render` 收到包含全部 LED 的最新输出。协议级写入、ACK、重试和瞬时通信错误恢复都由
-设备插件负责：插件可以放弃当前帧并正常返回，让 worker 继续取得最新帧；任何未捕获
-Lua error 仍会停止当前管线。device runtime 独占一个 worker 线程；`render` 返回表示
-本次驱动调用已经结束。设备忙碌期间被覆盖的中间帧不会发送。
+每个单机模式包含：
+
+| 字段 | 类型 | 要求 |
+|---|---|---|
+| `id` | UTF-8 string | 必填；当前设备内唯一且稳定 |
+| `name` | UTF-8 string | 必填；显示名称 |
+| `description` | UTF-8 string/nil | 可选；模式说明 |
+| `data` | binary string/nil | 可选；原样传回插件，缺省为 `id` 的 UTF-8 bytes |
+| `controls` | array/nil | 可选；按声明顺序显示的配置控件 |
+
+每个控件包含必填的 `id`、`name` 和 `component`，以及可选的 `description`。控件 `id`
+是当前模式内唯一的配置键。GUI 根据 `component.type` 生成界面，并在提交时以控件 ID
+为键构造 `settings` table。
+
+当前支持两种 component：
+
+| `type` | component 字段 | `settings[control.id]` |
+|---|---|---|
+| `slider` | `min`、`max`、`default`，均为 32 位整数且 `min <= default <= max` | 当前整数值 |
+| `color` | `default = { red, green, blue }`，每个通道为 `0..255` | 当前 RGB table |
+
+`color` 组件在 GUI 中显示为 R、G、B 三个通道滑块。当 `controls = {}` 时，GUI 直接显示
+应用按钮，提交的 `settings` 是空 table。
+
+`open(device)` 获得 HID 句柄并构造私有实例，`close(instance)` 释放实例资源。
+`enter_live(instance)` 配置实时控制模式，`apply_mode(instance, mode, settings)` 配置单机模式。
+
+当 `live == true` 时，插件必须导出 `enter_live()` 和 `render()`。内核先打开会话并调用
+一次 `enter_live()`，之后才启动实时帧传递。`render` 收到包含全部 LED 的最新输出。
+协议级写入、ACK、重试和瞬时通信错误恢复都由设备插件负责：插件可以放弃当前帧并正常
+返回，让 worker 继续取得最新帧；任何未捕获 Lua error 都会停止当前实时管线。
+
+注册了单机模式时，插件必须导出 `apply_mode(instance, mode, settings)`。点击“应用”后，
+内核在后台按 `open -> apply_mode -> close` 顺序执行单机事务，并传入当前模式及其完整
+控件值。
 
 `discover(hids)` 中每个 HID `info` 的字段：
 
@@ -211,7 +296,7 @@ effect runtime 接收矩阵和时间上下文。`start`/`stop` 可选，`render`
 local effect = {}
 
 function effect.start(context)
-    -- effect 被打开时调用一次；返回值作为私有 state 保存。
+    -- effect 被打开时调用一次；返回值作为 state 传给 render()/stop()。
     return { speed = 0.2 }
 end
 

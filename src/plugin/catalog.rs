@@ -8,7 +8,7 @@ use mlua::{Lua, LuaString, Table};
 use super::{PluginMetadata, PluginType};
 use crate::hid::{HidDeviceInfo, HidManager};
 use crate::runtime::LuaPluginRuntime;
-use crate::types::DeviceMatrix;
+use crate::types::{DeviceCapabilities, DeviceMatrix};
 
 #[derive(Clone, Debug)]
 pub struct RegisteredDevice {
@@ -17,6 +17,7 @@ pub struct RegisteredDevice {
     pub name: String,
     pub serial_number: Option<String>,
     pub matrix: DeviceMatrix,
+    pub capabilities: DeviceCapabilities,
     pub data: Vec<u8>,
 }
 
@@ -30,11 +31,17 @@ impl RegisteredDevice {
     }
 
     pub(crate) fn to_lua(&self, lua: &Lua) -> mlua::Result<Table> {
-        let registration = lua.create_table_with_capacity(0, 5)?;
+        let registration = lua.create_table_with_capacity(0, 7)?;
         registration.set("id", lua.create_string(&self.id)?)?;
         registration.set("name", self.name.as_str())?;
         registration.set("serial_number", self.serial_number.clone())?;
         registration.set("matrix", self.matrix.to_lua(lua)?)?;
+        if self.capabilities.live {
+            registration.set("live", true)?;
+        }
+        if !self.capabilities.modes.is_empty() {
+            registration.set("modes", self.capabilities.modes_to_lua(lua)?)?;
+        }
         registration.set("data", lua.create_string(&self.data)?)?;
         Ok(registration)
     }
@@ -183,6 +190,20 @@ fn discover_plugin(
             .with_context(|| format!("设备插件 {} 的第 {index} 个注册项无效", plugin.name))?;
         devices.push(parse_registration(plugin, registration, index)?);
     }
+    if !devices.is_empty() {
+        runtime.required_function("open")?;
+        runtime.optional_function("close")?;
+        if devices.iter().any(|device| device.capabilities.live) {
+            runtime.required_function("enter_live")?;
+            runtime.required_function("render")?;
+        }
+        if devices
+            .iter()
+            .any(|device| !device.capabilities.modes.is_empty())
+        {
+            runtime.required_function("apply_mode")?;
+        }
+    }
     Ok(devices)
 }
 
@@ -211,6 +232,14 @@ fn parse_registration(
         .with_context(|| format!("{}缺少 matrix", context()))?;
     let matrix = DeviceMatrix::from_lua(matrix)
         .with_context(|| format!("{}提供的 matrix 无效", context()))?;
+    let live: Option<bool> = registration
+        .get("live")
+        .with_context(|| format!("{}的 live 必须是 boolean 或 nil", context()))?;
+    let modes: Option<Table> = registration
+        .get("modes")
+        .with_context(|| format!("{}的 modes 必须是 table 或 nil", context()))?;
+    let capabilities = DeviceCapabilities::from_lua(live, modes)
+        .with_context(|| format!("{}提供的控制能力无效", context()))?;
     let data = registration
         .get::<Option<LuaString>>("data")
         .with_context(|| format!("{}的 data 必须是二进制字符串或 nil", context()))?
@@ -223,6 +252,7 @@ fn parse_registration(
         name,
         serial_number,
         matrix,
+        capabilities,
         data,
     })
 }

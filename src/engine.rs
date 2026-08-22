@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::device::ActiveDevice;
+use crate::device::LiveDeviceSession;
 use crate::effect::ActiveEffect;
 use crate::hid::HidManager;
 use crate::plugin::{PluginMetadata, RegisteredDevice};
@@ -14,18 +14,18 @@ use crate::types::{ColorFrame, DeviceMatrix};
 
 const EFFECT_INTERVAL: Duration = Duration::from_nanos(16_666_667);
 
-pub struct Pipeline {
-    device: DeviceWorker,
+pub struct LivePipeline {
+    device: LiveDeviceWorker,
     effect: EffectWorker,
 }
 
-impl Pipeline {
+impl LivePipeline {
     pub fn start(
         device: &RegisteredDevice,
         effect: &PluginMetadata,
         hid: &HidManager,
     ) -> Result<Self> {
-        let device = DeviceWorker::start(device, hid)?;
+        let device = LiveDeviceWorker::start(device, hid)?;
         let effect =
             EffectWorker::start(effect, device.matrix().clone(), Arc::clone(&device.shared))?;
         Ok(Self { device, effect })
@@ -39,7 +39,13 @@ impl Pipeline {
     pub fn stop(&mut self) -> Result<()> {
         let effect = self.effect.stop();
         let device = self.device.stop();
-        effect.and(device)
+        match (effect, device) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(effect), Err(device)) => {
+                bail!("停止实时灯效失败：{effect:#}；关闭 HID 会话时又发生错误：{device:#}")
+            }
+        }
     }
 
     pub fn matches_device(&self, device: &RegisteredDevice) -> bool {
@@ -59,7 +65,7 @@ impl Pipeline {
     }
 }
 
-impl Drop for Pipeline {
+impl Drop for LivePipeline {
     fn drop(&mut self) {
         let _ = self.stop();
     }
@@ -73,7 +79,11 @@ struct EffectWorker {
 }
 
 impl EffectWorker {
-    fn start(metadata: &PluginMetadata, matrix: DeviceMatrix, device: Arc<Shared>) -> Result<Self> {
+    fn start(
+        metadata: &PluginMetadata,
+        matrix: DeviceMatrix,
+        device: Arc<FrameMailbox>,
+    ) -> Result<Self> {
         let name = metadata.name.clone();
         let worker_name = name.clone();
         let metadata = metadata.clone();
@@ -116,14 +126,11 @@ impl EffectWorker {
 
     fn stop(&mut self) -> Result<()> {
         self.stopped.store(true, Ordering::Relaxed);
-        let error = self.errors.try_recv().ok();
         if let Some(thread) = self.thread.take() {
             thread.thread().unpark();
-            if thread.is_finished() {
-                ensure!(thread.join().is_ok(), "灯效线程发生 panic");
-            }
+            ensure!(thread.join().is_ok(), "灯效线程发生 panic");
         }
-        match error {
+        match self.errors.try_recv().ok() {
             Some(error) => bail!(error),
             None => Ok(()),
         }
@@ -143,7 +150,7 @@ impl Drop for EffectWorker {
 fn run_effect(
     metadata: PluginMetadata,
     matrix: DeviceMatrix,
-    device: Arc<Shared>,
+    device: Arc<FrameMailbox>,
     stopped: &Arc<AtomicBool>,
 ) -> Result<()> {
     let effect = ActiveEffect::start(&metadata, &matrix)?;
@@ -188,24 +195,24 @@ fn run_effect(
     Ok(())
 }
 
-struct DeviceWorker {
+struct LiveDeviceWorker {
     plugin_id: String,
     device_id: Vec<u8>,
     name: String,
     matrix: DeviceMatrix,
-    shared: Arc<Shared>,
+    shared: Arc<FrameMailbox>,
     thread: Option<JoinHandle<()>>,
 }
 
-impl DeviceWorker {
+impl LiveDeviceWorker {
     fn start(registered: &RegisteredDevice, hid: &HidManager) -> Result<Self> {
-        let mut device = ActiveDevice::open(registered, hid)?;
+        let mut device = LiveDeviceSession::start(registered, hid)?;
         let name = device.name().to_owned();
         let matrix = device.matrix().clone();
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(FrameMailbox::default());
         let worker_shared = Arc::clone(&shared);
         let thread = thread::Builder::new()
-            .name(format!("rgb-device-{}", registered.plugin.id))
+            .name(format!("rgb-live-device-{}", registered.plugin.id))
             .spawn(move || {
                 while let Some(frame) = worker_shared.next() {
                     if let Err(error) = device.render(&frame) {
@@ -260,27 +267,27 @@ impl DeviceWorker {
     }
 }
 
-impl Drop for DeviceWorker {
+impl Drop for LiveDeviceWorker {
     fn drop(&mut self) {
         let _ = self.stop();
     }
 }
 
 #[derive(Default)]
-struct Shared {
-    state: Mutex<State>,
+struct FrameMailbox {
+    state: Mutex<FrameMailboxState>,
     ready: Condvar,
 }
 
 #[derive(Default)]
-struct State {
+struct FrameMailboxState {
     latest: Option<ColorFrame>,
     current: Option<ColorFrame>,
     stopped: bool,
     error: Option<String>,
 }
 
-impl Shared {
+impl FrameMailbox {
     fn send(&self, frame: ColorFrame) -> Result<()> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(error) = &state.error {
@@ -352,7 +359,7 @@ mod tests {
 
     #[test]
     fn only_the_latest_frame_is_kept() {
-        let shared = Shared::default();
+        let shared = FrameMailbox::default();
         let latest = vec![4, 5, 6];
         shared.send(vec![1, 2, 3]).unwrap();
         shared.send(latest.clone()).unwrap();
@@ -361,7 +368,7 @@ mod tests {
 
     #[test]
     fn rendered_frame_is_kept_while_a_new_frame_waits() {
-        let shared = Shared::default();
+        let shared = FrameMailbox::default();
         let rendered = vec![1, 2, 3];
         shared.send(rendered.clone()).unwrap();
         shared.mark_rendered(shared.next().unwrap());
