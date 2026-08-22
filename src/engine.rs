@@ -53,6 +53,10 @@ impl Pipeline {
     pub fn effect_name(&self) -> &str {
         self.effect.name()
     }
+
+    pub fn current_frame(&self) -> Option<ColorFrame> {
+        self.device.shared.current_frame()
+    }
 }
 
 impl Drop for Pipeline {
@@ -208,6 +212,7 @@ impl DeviceWorker {
                         worker_shared.fail(format!("设备渲染失败：{error:#}"));
                         break;
                     }
+                    worker_shared.mark_rendered(frame);
                 }
                 if let Err(error) = device.close() {
                     worker_shared.fail(format!("关闭设备失败：{error:#}"));
@@ -270,6 +275,7 @@ struct Shared {
 #[derive(Default)]
 struct State {
     latest: Option<ColorFrame>,
+    current: Option<ColorFrame>,
     stopped: bool,
     error: Option<String>,
 }
@@ -299,6 +305,21 @@ impl Shared {
         } else {
             state.latest.take()
         }
+    }
+
+    fn mark_rendered(&self, frame: ColorFrame) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .current = Some(frame);
+    }
+
+    fn current_frame(&self) -> Option<ColorFrame> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .current
+            .clone()
     }
 
     fn stop(&self) {
@@ -336,5 +357,17 @@ mod tests {
         shared.send(vec![1, 2, 3]).unwrap();
         shared.send(latest.clone()).unwrap();
         assert_eq!(shared.next(), Some(latest));
+    }
+
+    #[test]
+    fn rendered_frame_is_kept_while_a_new_frame_waits() {
+        let shared = Shared::default();
+        let rendered = vec![1, 2, 3];
+        shared.send(rendered.clone()).unwrap();
+        shared.mark_rendered(shared.next().unwrap());
+
+        shared.send(vec![4, 5, 6]).unwrap();
+
+        assert_eq!(shared.current_frame(), Some(rendered));
     }
 }

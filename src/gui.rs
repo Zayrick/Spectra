@@ -11,13 +11,16 @@ use std::{
 #[cfg(target_os = "macos")]
 use block2::RcBlock;
 use iced::alignment::{Horizontal, Vertical};
-use iced::widget::{button, column, container, mouse_area, pane_grid, row, rule, scrollable, text};
+use iced::widget::{
+    button, canvas, column, container, mouse_area, pane_grid, row, rule, scrollable, text,
+};
 #[cfg(not(target_os = "macos"))]
 use iced::widget::{svg, tooltip};
 #[cfg(target_os = "macos")]
 use iced::window::raw_window_handle::RawWindowHandle;
 use iced::{
-    Background, Border, Element, Length, Padding, Size, Subscription, Task, Theme, time, window,
+    Background, Border, Color, Element, Length, Padding, Point, Rectangle, Renderer, Size,
+    Subscription, Task, Theme, mouse, time, window,
 };
 #[cfg(target_os = "macos")]
 use objc2::rc::Retained;
@@ -34,9 +37,10 @@ use objc2_foundation::{
 use crate::engine::Pipeline;
 use crate::hid::HidManager;
 use crate::plugin::{PluginCatalog, PluginMetadata, RegisteredDevice};
+use crate::types::{ColorFrame, DeviceMatrix};
 
 const HOTPLUG_INTERVAL: Duration = Duration::from_secs(1);
-const STATUS_INTERVAL: Duration = Duration::from_millis(100);
+const PREVIEW_INTERVAL: Duration = Duration::from_nanos(16_666_667);
 const WINDOW_SIZE: Size = Size::new(1040.0, 700.0);
 const MIN_WINDOW_SIZE: Size = Size::new(820.0, 600.0);
 const DEFAULT_SIDEBAR_RATIO: f32 = 200.0 / WINDOW_SIZE.width;
@@ -133,7 +137,7 @@ enum Message {
     WorkspaceResized(pane_grid::ResizeEvent),
     Rescan,
     AutoRescan,
-    PipelineStatus,
+    PipelineTick,
     WindowOpened(window::Id),
     DragWindow,
     ToggleMaximize,
@@ -187,7 +191,7 @@ impl App {
             }
             Message::Rescan => self.rescan(true),
             Message::AutoRescan => self.rescan(false),
-            Message::PipelineStatus => self.poll_pipeline(),
+            Message::PipelineTick => self.poll_pipeline(),
             Message::WindowOpened(window) => {
                 self.window_id = Some(window);
                 #[cfg(target_os = "macos")]
@@ -214,7 +218,7 @@ impl App {
             window::close_requests().map(Message::CloseRequested),
         ];
         if self.pipeline.is_some() {
-            subscriptions.push(time::every(STATUS_INTERVAL).map(|_| Message::PipelineStatus));
+            subscriptions.push(time::every(PREVIEW_INTERVAL).map(|_| Message::PipelineTick));
         }
         Subscription::batch(subscriptions)
     }
@@ -328,9 +332,12 @@ impl App {
                         .style(text::secondary),
                 ]
                 .spacing(4)
-                .width(Length::Fill);
+                .width(Length::FillPortion(5));
 
-                identity.into()
+                row![identity, self.lighting_preview(device)]
+                    .spacing(28)
+                    .height(Length::Fill)
+                    .into()
             }
             None => column![
                 text("设备信息").size(11).style(text::secondary),
@@ -358,6 +365,22 @@ impl App {
             .padding([18, 24])
             .style(device_info_style)
             .into()
+    }
+
+    fn lighting_preview<'a>(&'a self, device: &'a RegisteredDevice) -> Element<'a, Message> {
+        let frame = self
+            .pipeline
+            .as_ref()
+            .filter(|pipeline| pipeline.matches_device(device))
+            .and_then(Pipeline::current_frame);
+
+        canvas(LightingPreview {
+            matrix: &device.matrix,
+            frame,
+        })
+        .width(Length::FillPortion(4))
+        .height(Length::Fill)
+        .into()
     }
 
     fn effect_workspace(&self) -> Element<'_, Message> {
@@ -867,6 +890,67 @@ fn metadata_row<'a>(label: &'a str, value: &'a str) -> Element<'a, Message> {
     .spacing(10)
     .align_y(Vertical::Center)
     .into()
+}
+
+struct LightingPreview<'a> {
+    matrix: &'a DeviceMatrix,
+    frame: Option<ColorFrame>,
+}
+
+impl canvas::Program<Message> for LightingPreview<'_> {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let palette = theme.extended_palette();
+        let mut drawing = canvas::Frame::new(renderer, bounds.size());
+
+        let cell_size = (bounds.width / f32::from(self.matrix.width))
+            .min(bounds.height / f32::from(self.matrix.height));
+        if cell_size <= 0.0 {
+            return vec![drawing.into_geometry()];
+        }
+
+        let grid_width = cell_size * f32::from(self.matrix.width);
+        let grid_height = cell_size * f32::from(self.matrix.height);
+        let origin = Point::new(
+            (bounds.width - grid_width) / 2.0,
+            (bounds.height - grid_height) / 2.0,
+        );
+        let gap = (cell_size * 0.18).clamp(1.0, 3.5);
+        let led_size = Size::new((cell_size - gap).max(1.0), (cell_size - gap).max(1.0));
+        let radius = (led_size.width * 0.24).clamp(1.0, 4.0);
+        let inactive = palette.background.strong.color;
+        let outline = palette.background.base.text.scale_alpha(0.18);
+        let mut colors = self.frame.as_deref().unwrap_or_default().chunks_exact(3);
+
+        for led in &self.matrix.leds {
+            let color = colors
+                .next()
+                .map(|rgb| Color::from_rgb8(rgb[0], rgb[1], rgb[2]))
+                .unwrap_or(inactive);
+            let position = Point::new(
+                origin.x + f32::from(led.x) * cell_size + gap / 2.0,
+                origin.y + f32::from(led.y) * cell_size + gap / 2.0,
+            );
+            let light = canvas::Path::rounded_rectangle(position, led_size, radius.into());
+            drawing.fill(&light, color);
+            drawing.stroke(
+                &light,
+                canvas::Stroke::default()
+                    .with_color(outline)
+                    .with_width(0.75),
+            );
+        }
+
+        vec![drawing.into_geometry()]
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
