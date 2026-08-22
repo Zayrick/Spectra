@@ -40,7 +40,7 @@ use crate::plugin::{PluginCatalog, PluginMetadata, RegisteredDevice};
 use crate::types::{ColorFrame, DeviceMatrix};
 
 const HOTPLUG_INTERVAL: Duration = Duration::from_secs(1);
-const PREVIEW_INTERVAL: Duration = Duration::from_nanos(16_666_667);
+const PREVIEW_INTERVAL: Duration = Duration::from_millis(50);
 const PIPELINE_STATUS_INTERVAL: Duration = Duration::from_millis(100);
 const WINDOW_SIZE: Size = Size::new(1040.0, 700.0);
 const MIN_WINDOW_SIZE: Size = Size::new(820.0, 600.0);
