@@ -25,13 +25,15 @@ use iced::{
 #[cfg(target_os = "macos")]
 use objc2::rc::Retained;
 #[cfg(target_os = "macos")]
+use objc2::runtime::{AnyObject, ProtocolObject};
+#[cfg(target_os = "macos")]
 use objc2_app_kit::{
     NSView, NSWindow, NSWindowButton, NSWindowDidUpdateNotification,
     NSWindowWillEnterFullScreenNotification, NSWindowWillExitFullScreenNotification,
 };
 #[cfg(target_os = "macos")]
 use objc2_foundation::{
-    NSNotification, NSNotificationCenter, NSNotificationName, NSObject, NSPoint,
+    NSNotification, NSNotificationCenter, NSNotificationName, NSObjectProtocol, NSPoint,
 };
 
 use crate::engine::Pipeline;
@@ -627,7 +629,7 @@ struct MacOSWindowControlPositions {
 #[cfg(target_os = "macos")]
 struct MacOSWindowObservers {
     center: Retained<NSNotificationCenter>,
-    observers: [Retained<NSObject>; 3],
+    observers: [Retained<ProtocolObject<dyn NSObjectProtocol>>; 3],
 }
 
 #[cfg(target_os = "macos")]
@@ -636,7 +638,10 @@ impl Drop for MacOSWindowObservers {
         for observer in &self.observers {
             // SAFETY: Each value is an observer token issued by this center,
             // and window teardown happens on AppKit's main thread.
-            unsafe { self.center.removeObserver(observer) };
+            unsafe {
+                self.center
+                    .removeObserver(AsRef::<AnyObject>::as_ref(&**observer))
+            };
         }
     }
 }
@@ -670,7 +675,7 @@ fn install_macos_window_observers(window_id: window::Id) -> Task<Message> {
         // AppKit owns the title-bar layout while full-screen. During normal
         // window updates, restore the custom offset if AppKit laid it out again.
         let fullscreen = Rc::new(Cell::new(false));
-        let center = unsafe { NSNotificationCenter::defaultCenter() };
+        let center = NSNotificationCenter::defaultCenter();
         let observers = [
             {
                 let callback_window = window.clone();
@@ -729,7 +734,7 @@ fn add_macos_window_observer(
     window: &NSWindow,
     name: &NSNotificationName,
     handler: impl Fn() + 'static,
-) -> Retained<NSObject> {
+) -> Retained<ProtocolObject<dyn NSObjectProtocol>> {
     let block = RcBlock::new(move |_notification: NonNull<NSNotification>| handler());
 
     // SAFETY: AppKit posts these window notifications on the main thread. The
@@ -749,9 +754,9 @@ fn remove_macos_window_observers() {
 #[cfg(target_os = "macos")]
 fn macos_window_control_positions(window: &NSWindow) -> Option<MacOSWindowControlPositions> {
     let buttons = [
-        window.standardWindowButton(NSWindowButton::NSWindowCloseButton)?,
-        window.standardWindowButton(NSWindowButton::NSWindowMiniaturizeButton)?,
-        window.standardWindowButton(NSWindowButton::NSWindowZoomButton)?,
+        window.standardWindowButton(NSWindowButton::CloseButton)?,
+        window.standardWindowButton(NSWindowButton::MiniaturizeButton)?,
+        window.standardWindowButton(NSWindowButton::ZoomButton)?,
     ];
     let standard = buttons.each_ref().map(|button| button.frame().origin);
     let windowed = buttons.each_ref().map(|button| {
@@ -775,9 +780,9 @@ fn macos_window_control_positions(window: &NSWindow) -> Option<MacOSWindowContro
 #[cfg(target_os = "macos")]
 fn set_macos_window_control_positions(window: &NSWindow, positions: [NSPoint; 3]) {
     for (kind, position) in [
-        NSWindowButton::NSWindowCloseButton,
-        NSWindowButton::NSWindowMiniaturizeButton,
-        NSWindowButton::NSWindowZoomButton,
+        NSWindowButton::CloseButton,
+        NSWindowButton::MiniaturizeButton,
+        NSWindowButton::ZoomButton,
     ]
     .into_iter()
     .zip(positions)
@@ -789,9 +794,7 @@ fn set_macos_window_control_positions(window: &NSWindow, positions: [NSPoint; 3]
             continue;
         }
 
-        // SAFETY: The button belongs to this live NSWindow, and all callers run
-        // on AppKit's main thread.
-        unsafe { button.setFrameOrigin(position) };
+        button.setFrameOrigin(position);
     }
 }
 
