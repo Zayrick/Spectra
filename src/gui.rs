@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 #[cfg(not(target_os = "macos"))]
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -42,8 +43,10 @@ use crate::hid::HidManager;
 use crate::plugin::{PluginCatalog, PluginMetadata, RegisteredDevice};
 use crate::types::{
     ColorFrame, DeviceMatrix, DeviceMode, ModeComponent, ModeControl, ModeSettings, ModeValue,
-    SliderRange,
+    RgbColor, SliderRange,
 };
+
+mod color_picker;
 
 const HOTPLUG_INTERVAL: Duration = Duration::from_secs(1);
 const PREVIEW_INTERVAL: Duration = Duration::from_millis(50);
@@ -129,6 +132,8 @@ struct App {
     control_page: ControlPage,
     selected_mode_id: Option<String>,
     mode_settings: Option<ModeSettings>,
+    color_hex_drafts: HashMap<String, String>,
+    active_color_picker: Option<ActiveColorPicker>,
     workspace: pane_grid::State<WorkspacePane>,
     live_pipeline: Option<LivePipeline>,
     mode_action_pending: bool,
@@ -143,11 +148,9 @@ enum ControlPage {
     Standalone,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum ColorChannel {
-    Red,
-    Green,
-    Blue,
+struct ActiveColorPicker {
+    control_id: String,
+    hue: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -162,10 +165,9 @@ enum Message {
     ControlPageSelected(ControlPage),
     ToggleEffect(EffectOption),
     DeviceModeSelected(String),
-    ModeColorChanged {
+    ModeColorEvent {
         control_id: String,
-        channel: ColorChannel,
-        value: u8,
+        event: color_picker::Event,
     },
     ModeSliderChanged {
         control_id: String,
@@ -223,6 +225,8 @@ impl App {
             control_page: ControlPage::Live,
             selected_mode_id: None,
             mode_settings: None,
+            color_hex_drafts: HashMap::new(),
+            active_color_picker: None,
             workspace,
             live_pipeline: None,
             mode_action_pending: false,
@@ -240,22 +244,8 @@ impl App {
             Message::ControlPageSelected(page) => self.select_control_page(page),
             Message::ToggleEffect(effect) => self.toggle_effect(effect),
             Message::DeviceModeSelected(mode_id) => self.select_device_mode(mode_id),
-            Message::ModeColorChanged {
-                control_id,
-                channel,
-                value,
-            } => {
-                if let Some(ModeValue::Color(color)) = self
-                    .mode_settings
-                    .as_mut()
-                    .and_then(|settings| settings.get_mut(&control_id))
-                {
-                    match channel {
-                        ColorChannel::Red => color.red = value,
-                        ColorChannel::Green => color.green = value,
-                        ColorChannel::Blue => color.blue = value,
-                    }
-                }
+            Message::ModeColorEvent { control_id, event } => {
+                self.update_color_control(&control_id, event);
             }
             Message::ModeSliderChanged { control_id, value } => {
                 if let Some(ModeValue::Slider(current)) = self
@@ -864,13 +854,9 @@ impl App {
             (ModeComponent::Slider(range), ModeValue::Slider(value)) => {
                 self.slider_control(&control.id, *range, *value)
             }
-            (ModeComponent::Color(_), ModeValue::Color(color)) => column![
-                self.color_slider("R", &control.id, ColorChannel::Red, color.red,),
-                self.color_slider("G", &control.id, ColorChannel::Green, color.green,),
-                self.color_slider("B", &control.id, ColorChannel::Blue, color.blue,),
-            ]
-            .spacing(7)
-            .into(),
+            (ModeComponent::Color(_), ModeValue::Color(color)) => {
+                self.color_control(&control.id, *color)
+            }
             _ => text("控件值类型无效").size(11).style(text::danger).into(),
         };
 
@@ -883,26 +869,122 @@ impl App {
         content.push(component).into()
     }
 
-    fn color_slider<'a>(
-        &self,
-        label: &'a str,
-        control_id: &str,
-        channel: ColorChannel,
-        value: u8,
-    ) -> Element<'a, Message> {
+    fn color_control<'a>(&self, control_id: &str, color: RgbColor) -> Element<'a, Message> {
+        let hex = self
+            .color_hex_drafts
+            .get(control_id)
+            .cloned()
+            .unwrap_or_else(|| color_picker::format_hex(color));
+        let active = self
+            .active_color_picker
+            .as_ref()
+            .filter(|picker| picker.control_id == control_id);
+        let (derived_hue, _, _) = color_picker::rgb_to_hsv(color);
+        let hue = active.map_or(derived_hue, |picker| picker.hue);
+        let open = active.is_some();
         let control_id = control_id.to_owned();
-        row![
-            text(label).size(11).width(Length::Fixed(22.0)),
-            slider(0..=u8::MAX, value, move |value| Message::ModeColorChanged {
-                control_id: control_id.clone(),
-                channel,
-                value,
-            }),
-            text(value).size(11).width(Length::Fixed(34.0)),
-        ]
-        .spacing(8)
-        .align_y(Vertical::Center)
-        .into()
+
+        color_picker::view(color, &hex, hue, open).map(move |event| Message::ModeColorEvent {
+            control_id: control_id.clone(),
+            event,
+        })
+    }
+
+    fn update_color_control(&mut self, control_id: &str, event: color_picker::Event) {
+        match event {
+            color_picker::Event::Toggle => {
+                if self
+                    .active_color_picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.control_id == control_id)
+                {
+                    self.active_color_picker = None;
+                } else if let Some(color) = self.mode_color(control_id) {
+                    let (hue, _, _) = color_picker::rgb_to_hsv(color);
+                    self.active_color_picker = Some(ActiveColorPicker {
+                        control_id: control_id.to_owned(),
+                        hue,
+                    });
+                }
+            }
+            color_picker::Event::Dismiss => {
+                if self
+                    .active_color_picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.control_id == control_id)
+                {
+                    self.active_color_picker = None;
+                }
+            }
+            color_picker::Event::HexChanged(input) => {
+                let Some(input) = color_picker::normalize_hex_input(&input) else {
+                    return;
+                };
+                if let Some(color) = color_picker::parse_hex(&input) {
+                    if let Some(picker) = self
+                        .active_color_picker
+                        .as_mut()
+                        .filter(|picker| picker.control_id == control_id)
+                    {
+                        let (hue, saturation, _) = color_picker::rgb_to_hsv(color);
+                        if saturation > 0.0 {
+                            picker.hue = hue;
+                        }
+                    }
+                    self.set_mode_color(control_id, color);
+                } else {
+                    self.color_hex_drafts.insert(control_id.to_owned(), input);
+                }
+            }
+            color_picker::Event::SaturationValueChanged { saturation, value } => {
+                let Some(current) = self.mode_color(control_id) else {
+                    return;
+                };
+                let hue = self
+                    .active_color_picker
+                    .as_ref()
+                    .filter(|picker| picker.control_id == control_id)
+                    .map_or_else(|| color_picker::rgb_to_hsv(current).0, |picker| picker.hue);
+                self.set_mode_color(control_id, color_picker::hsv_to_rgb(hue, saturation, value));
+            }
+            color_picker::Event::HueChanged(hue) => {
+                let Some(current) = self.mode_color(control_id) else {
+                    return;
+                };
+                if let Some(picker) = self
+                    .active_color_picker
+                    .as_mut()
+                    .filter(|picker| picker.control_id == control_id)
+                {
+                    picker.hue = hue;
+                }
+                let (_, saturation, value) = color_picker::rgb_to_hsv(current);
+                self.set_mode_color(control_id, color_picker::hsv_to_rgb(hue, saturation, value));
+            }
+        }
+    }
+
+    fn mode_color(&self, control_id: &str) -> Option<RgbColor> {
+        match self.mode_settings.as_ref()?.get(control_id)? {
+            ModeValue::Color(color) => Some(*color),
+            ModeValue::Slider(_) => None,
+        }
+    }
+
+    fn set_mode_color(&mut self, control_id: &str, color: RgbColor) {
+        if let Some(ModeValue::Color(current)) = self
+            .mode_settings
+            .as_mut()
+            .and_then(|settings| settings.get_mut(control_id))
+        {
+            *current = color;
+            self.color_hex_drafts.remove(control_id);
+        }
+    }
+
+    fn reset_color_editor(&mut self) {
+        self.active_color_picker = None;
+        self.color_hex_drafts.clear();
     }
 
     fn slider_control<'a>(
@@ -958,6 +1040,7 @@ impl App {
         if let Some(settings) = settings {
             self.selected_mode_id = Some(mode_id);
             self.mode_settings = Some(settings);
+            self.reset_color_editor();
         }
     }
 
@@ -971,6 +1054,7 @@ impl App {
             self.control_page = ControlPage::Live;
             self.selected_mode_id = None;
             self.mode_settings = None;
+            self.reset_color_editor();
             return;
         };
 
@@ -982,6 +1066,7 @@ impl App {
         let mode = device.capabilities.modes.first();
         self.selected_mode_id = mode.map(|mode| mode.id.clone());
         self.mode_settings = mode.map(DeviceMode::default_settings);
+        self.reset_color_editor();
     }
 
     fn apply_selected_mode(&mut self) -> Task<Message> {

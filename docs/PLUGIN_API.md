@@ -192,7 +192,8 @@ return plugin
 | `slider` | `min`、`max`、`default`，均为 32 位整数且 `min <= default <= max` | 当前整数值 |
 | `color` | `default = { red, green, blue }`，每个通道为 `0..255` | 当前 RGB table |
 
-`color` 组件在 GUI 中显示为 R、G、B 三个通道滑块。当 `controls = {}` 时，GUI 直接显示
+`color` 组件在 GUI 中显示为色块和 `#RRGGBB` 输入框；点击色块可通过色相环及其内接的
+饱和度/明度三角形选择颜色。当 `controls = {}` 时，GUI 直接显示
 应用按钮，提交的 `settings` 是空 table。
 
 `open(device)` 获得 HID 句柄并构造私有实例，`close(instance)` 释放实例资源。
