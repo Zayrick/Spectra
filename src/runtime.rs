@@ -32,7 +32,7 @@ impl LuaPluginRuntime {
         let lua = Lua::new();
         lua.set_memory_limit(LUA_MEMORY_LIMIT)
             .context("设置 Lua runtime 内存上限失败")?;
-        install_require(&lua, hid)?;
+        install_require(&lua, metadata.plugin_type, hid)?;
 
         let module: Table = lua
             .load(source)
@@ -65,15 +65,20 @@ impl LuaPluginRuntime {
     }
 }
 
-fn install_require(lua: &Lua, hid: Option<&HidManager>) -> Result<()> {
+fn install_require(lua: &Lua, plugin_type: PluginType, hid: Option<&HidManager>) -> Result<()> {
     let hid = hid.map(|hid| hid.lua_module(lua)).transpose()?;
-    let require = lua.create_function(move |_, name: String| {
-        if name == "@Spectra/hidapi" {
-            return hid.clone().ok_or_else(|| {
-                mlua::Error::RuntimeError("@Spectra/hidapi 在这个 runtime 中不可用".into())
-            });
-        }
-        Err(mlua::Error::RuntimeError(format!("未知 module {name:?}")))
+    let skia = match plugin_type {
+        PluginType::Device => None,
+        PluginType::Effect => Some(crate::skia::lua_module(lua)?),
+    };
+    let require = lua.create_function(move |_, name: String| match name.as_str() {
+        "@Spectra/hidapi" => hid.clone().ok_or_else(|| {
+            mlua::Error::RuntimeError("@Spectra/hidapi 在这个 runtime 中不可用".into())
+        }),
+        "@Spectra/skia" => skia.clone().ok_or_else(|| {
+            mlua::Error::RuntimeError("@Spectra/skia 在这个 runtime 中不可用".into())
+        }),
+        _ => Err(mlua::Error::RuntimeError(format!("未知 module {name:?}"))),
     })?;
     lua.globals().set("require", require)?;
     Ok(())
@@ -85,11 +90,24 @@ mod tests {
     use mlua::Value;
 
     #[test]
-    fn isolates_hid_capability_to_device_runtime() {
+    fn exposes_capabilities_by_runtime_type() {
         let lua = Lua::new();
-        install_require(&lua, None).unwrap();
+        install_require(&lua, PluginType::Effect, None).unwrap();
+        assert!(
+            lua.load("return type(require('@Spectra/skia'))")
+                .eval::<String>()
+                .is_ok_and(|value| value == "table")
+        );
         let error = lua
             .load("return require('@Spectra/hidapi')")
+            .eval::<Value>()
+            .unwrap_err();
+        assert!(error.to_string().contains("不可用"));
+
+        let lua = Lua::new();
+        install_require(&lua, PluginType::Device, None).unwrap();
+        let error = lua
+            .load("return require('@Spectra/skia')")
             .eval::<Value>()
             .unwrap_err();
         assert!(error.to_string().contains("不可用"));

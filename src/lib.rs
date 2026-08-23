@@ -5,4 +5,5 @@ pub mod gui;
 pub mod hid;
 pub mod plugin;
 pub mod runtime;
+pub mod skia;
 pub mod types;

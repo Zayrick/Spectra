@@ -293,6 +293,49 @@ dev:close()
 
 effect runtime 接收矩阵和时间上下文。`start`/`stop` 可选，`render` 必填：
 
+### `@Spectra/skia`
+
+effect runtime 提供此 module。module 函数：
+
+```lua
+local skia = require("@Spectra/skia")
+local surface = skia.surface(width, height)
+local shader = skia.runtime_shader(sksl_source)
+```
+
+`runtime_shader()` 将 SkSL 源码编译为 runtime shader userdata。应在 `start()` 中编译并
+保存在 state 中，避免每帧重复编译。shader 方法：
+
+```lua
+shader:set_uniform_float("time", 1.25)
+shader:set_uniform_float("resolution", { width, height })
+shader:set_uniform_int("mode", 1)
+shader:set_uniform_int("range", { 1, 2, 3, 4 })
+```
+
+float uniform 接受单个 number 或长度为 `1..16` 的数组；int uniform 接受单个 integer
+或长度为 `1..4` 的数组。名称、SkSL 类型和值数量必须匹配。
+
+`surface()` 创建 RGBA8888 premultiplied-alpha GPU surface userdata，macOS、Windows 和
+Linux 分别使用 Metal、Direct3D 12 和 Vulkan。`width` 和 `height` 是只读字段。surface
+方法：
+
+```lua
+surface:clear(red, green, blue)             -- alpha 默认为 255
+surface:clear(red, green, blue, alpha)
+surface:draw_shader(shader)                 -- shader 填满整个 surface
+local rgba = surface:pixels_rgba()          -- 同步 GPU 后按行返回 unpremultiplied RGBA bytes
+local rgb = surface:sample_rgb(points)      -- 同步 GPU 后按 points 顺序返回连续 RGB bytes
+```
+
+`sample_rgb(points)` 接收数组，其中每项包含从 0 开始的 integer `x`、`y`；
+`context.matrix.leds` 可直接传入。坐标必须位于 surface 内。读取方法会缓存当前 GPU
+surface 的完整 RGBA 回读，同一轮绘制后的后续读取不会重复同步。每个 surface 的回读
+buffer 上限是 32 MiB。Skia 调用同步执行；Lua instruction hook 无法在 C++ 绘制和 GPU
+回读过程中中断，因此 shader 和 surface 尺寸必须适合 60 Hz 帧预算。
+
+### 生命周期与输出
+
 ```lua
 local effect = {}
 

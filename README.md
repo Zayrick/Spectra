@@ -1,13 +1,16 @@
 # Spectra
 
 `Spectra` 是一个跨平台 RGB 基础设施原型。Rust 内核负责插件发现、Lua runtime、
-HID capability、设备控制能力、矩阵/颜色路由、60 Hz 实时调度和 iced GUI；设备支持与
-灯效由单文件 Lua 5.5 插件提供。
+HID/Skia capability、设备控制能力、矩阵/颜色路由、60 Hz 实时调度和 iced GUI；设备
+支持与灯效由单文件 Lua 5.5 插件提供。
 
 当前随仓库提供：
 
 - `plugins/effects/rainbow.lua`：根据任意设备矩阵坐标渲染的空间彩虹。
-- `plugins/effects/hypnotic_plasma.lua`：以多层正弦波渲染流动的高饱和度等离子色彩。
+- `plugins/effects/hypnotic_plasma.lua`：逐灯计算多层正弦波，生成流动的高饱和度
+  等离子色彩。
+- `plugins/effects/hypnotic_plasma_skia.lua`：通过 SkSL runtime shader 在 GPU 上生成
+  等离子色彩。
 
 ## 数据流
 
@@ -17,6 +20,8 @@ HID capability、设备控制能力、矩阵/颜色路由、60 Hz 实时调度�
                                   ▼
 设备发现 Lua VM ──discover(hids)──> 已注册的逻辑设备 ──> GUI
                                                         ├─实时──> 60 Hz 灯效 VM
+                                                        │             │
+                                                        │          Skia GPU
                                                         │             │ RGB bytes
                                                         │             ▼
                                                         │         设备 Lua VM
@@ -27,14 +32,17 @@ HID capability、设备控制能力、矩阵/颜色路由、60 Hz 实时调度�
 ```
 
 每次设备发现以及每个已启动插件都使用独立的 Lua 5.5 VM 和 module cache。设备发现和
-运行 runtime 可通过 `require("@Spectra/hidapi")` 获取 HID API；灯效 runtime 接收矩阵和
-时间组成的渲染上下文。设备插件在发现阶段注册设备支持的实时控制和设备端单机模式；
+运行 runtime 可通过 `require("@Spectra/hidapi")` 获取 HID API；灯效 runtime 可通过
+`require("@Spectra/skia")` 创建 GPU surface 和 SkSL runtime shader，并接收矩阵
+与时间组成的渲染上下文。设备插件在发现阶段注册设备支持的实时控制和设备端单机模式；
 单机模式的配置控件也由插件注册，应用后由设备固件独立运行。
 
 ## 运行
 
-项目使用 vendored Lua 5.5，不需要单独安装 Lua。Windows 使用原生 `hid.dll` 后端，
-Linux 使用 hidraw/basic-udev 后端，macOS 使用 HIDAPI 的系统后端。
+项目使用 vendored Lua 5.5，不需要单独安装 Lua。Skia GPU 后端在 macOS 使用 Metal、
+Windows 使用 Direct3D 12、Linux 使用 Vulkan 1.1 或更高版本，首次构建通过其默认 binary
+cache 下载官方预编译库。Windows 使用原生 `hid.dll` 后端，Linux 使用
+hidraw/basic-udev 后端，macOS 使用 HIDAPI 的系统后端。
 
 ```powershell
 cargo run --release
