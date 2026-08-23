@@ -155,7 +155,7 @@ return plugin
 它必须返回一个连续数组。返回空数组表示插件不注册任何设备。每个注册项包含：
 
 | 字段 | 类型 | 要求 |
-|---|---|---|
+| --- | --- | --- |
 | `id` | binary string | 必填；同一插件内唯一且在设备仍连接时保持稳定 |
 | `name` | UTF-8 string | 必填；显示给用户的设备名称 |
 | `serial_number` | UTF-8 string/nil | 可选；显示给用户的序列号 |
@@ -174,7 +174,7 @@ return plugin
 每个单机模式包含：
 
 | 字段 | 类型 | 要求 |
-|---|---|---|
+| --- | --- | --- |
 | `id` | UTF-8 string | 必填；当前设备内唯一且稳定 |
 | `name` | UTF-8 string | 必填；显示名称 |
 | `description` | UTF-8 string/nil | 可选；模式说明 |
@@ -188,7 +188,7 @@ return plugin
 当前支持两种 component：
 
 | `type` | component 字段 | `settings[control.id]` |
-|---|---|---|
+| --- | --- | --- |
 | `slider` | `min`、`max`、`default`，均为 32 位整数且 `min <= default <= max` | 当前整数值 |
 | `color` | `default = { red, green, blue }`，每个通道为 `0..255` | 当前 RGB table |
 
@@ -211,7 +211,7 @@ return plugin
 `discover(hids)` 中每个 HID `info` 的字段：
 
 | 字段 | 类型 | 含义 |
-|---|---|---|
+| --- | --- | --- |
 | `path` | binary string | HIDAPI 平台路径；应原样传给 `open_path` |
 | `vendor_id`, `product_id` | integer | USB/Bluetooth HID VID/PID |
 | `serial_number` | string/nil | 序列号 |
@@ -365,7 +365,7 @@ return effect
 `context` 字段：
 
 | 字段 | 类型 | 含义 |
-|---|---|---|
+| --- | --- | --- |
 | `matrix` | table | 当前活动设备矩阵；含 `cells` 和 `leds` |
 | `elapsed` | number | 灯效启动后的单调时间，秒 |
 | `delta` | number | 距上次 effect tick 的秒数 |
