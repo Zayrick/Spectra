@@ -203,7 +203,7 @@ impl App {
         let devices = match detect_devices(&catalog, &hid) {
             Ok(devices) => devices,
             Err(error) => {
-                eprintln!("初次 HID 扫描失败：{error:#}");
+                eprintln!("初次设备扫描失败：{error:#}");
                 Vec::new()
             }
         };
@@ -344,7 +344,7 @@ impl App {
             container(
                 column![
                     text("未发现设备").size(15),
-                    text("连接受支持的 HID 设备后会自动出现在这里")
+                    text("可用设备会自动出现在这里")
                         .size(12)
                         .style(text::secondary),
                 ]
@@ -414,7 +414,7 @@ impl App {
                     text(format!("S/N  {serial}"))
                         .size(12)
                         .style(text::secondary),
-                    text(format!("来源插件  {}", device.plugin.name))
+                    text(format!("设备来源  {}", device.plugin.name))
                         .size(12)
                         .style(text::secondary),
                 ]
@@ -661,7 +661,7 @@ impl App {
 
     fn start_live(&mut self) {
         let Some(DeviceOption(device)) = self.selected_device.clone() else {
-            eprintln!("没有可启动的受支持 HID 设备");
+            eprintln!("没有可启动的设备");
             return;
         };
         if !device.capabilities.live {
@@ -697,7 +697,7 @@ impl App {
 
     fn stop_live(&mut self) {
         match self.stop_live_pipeline() {
-            Ok(()) => eprintln!("实时灯效已停止，HID 会话已关闭"),
+            Ok(()) => eprintln!("实时灯效已停止，设备会话已关闭"),
             Err(error) => eprintln!("停止失败：{error:#}"),
         }
     }
@@ -1143,7 +1143,7 @@ impl App {
         let devices = match detect_devices(&self.catalog, &self.hid) {
             Ok(devices) => devices,
             Err(error) => {
-                eprintln!("HID 扫描失败：{error:#}");
+                eprintln!("设备扫描失败：{error:#}");
                 return;
             }
         };

@@ -7,3 +7,6 @@ pub mod plugin;
 pub mod runtime;
 pub mod skia;
 pub mod types;
+
+#[cfg(debug_assertions)]
+pub(crate) mod virtual_device;

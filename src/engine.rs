@@ -43,7 +43,7 @@ impl LivePipeline {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
             (Err(effect), Err(device)) => {
-                bail!("停止实时灯效失败：{effect:#}；关闭 HID 会话时又发生错误：{device:#}")
+                bail!("停止实时灯效失败：{effect:#}；关闭设备会话时又发生错误：{device:#}")
             }
         }
     }

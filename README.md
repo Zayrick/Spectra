@@ -51,10 +51,10 @@ cargo run --release
 GUI 操作：
 
 - 在左侧设备列表中选择设备；
-- 在“实时”页面点击灯效即可启动，点击正在运行的灯效即可停止管线并关闭 HID 会话；
+- 在“实时”页面点击灯效即可启动，点击正在运行的灯效即可停止管线并关闭设备会话；
 - 在“单机”页面选择设备端模式，使用插件为该模式声明的控件调整参数，然后应用；
 - 点击标题栏的“扫描设备”立即刷新设备列表；后台也会每秒自动扫描热插拔；
-- 关闭窗口时，应用会先停止活动实时管线并关闭 HID 会话。
+- 关闭窗口时，应用会先停止活动实时管线并关闭设备会话。
 
 解析并列出插件元数据：
 
@@ -62,7 +62,7 @@ GUI 操作：
 cargo run -- --list-plugins
 ```
 
-运行被 `@hid` 触发的 device 插件，并列出脚本实际注册的逻辑设备：
+枚举并列出当前发现的设备：
 
 ```powershell
 cargo run -- --list-devices
@@ -73,6 +73,17 @@ cargo run -- --list-devices
 ```powershell
 cargo run -- --plugin-dir D:\my-rgb-plugins
 ```
+
+debug 构建提供通过 mDNS 发现的虚拟测试设备。先启动一个指定矩阵大小的虚拟设备：
+
+```powershell
+cargo run --manifest-path tools/virtual_test_device/Cargo.toml -- --width 8 --height 4
+```
+
+再运行 `cargo run`，虚拟设备会和 HID 设备一起出现在 GUI 中。它在
+`127.0.0.1` 上使用由系统分配的随机 UDP 端口，通过
+`_spectra-vdev._udp.local.` 公布设备名、协议版本和矩阵大小，并在终端按秒输出内核发送的帧率、
+序号与第一颗 LED 的颜色。
 
 Linux 上还需要让当前用户拥有目标 `/dev/hidraw*` 的读写权限；通常通过 udev rule
 完成。macOS 首次访问设备时可能需要授予输入设备权限。
@@ -129,7 +140,7 @@ cargo test --all-targets
 
 ## 支持范围
 
-- 设备 transport 使用 HID；
+- 设备插件通过 HID 与设备通信；
 - GUI 同时运行一台设备和一个实时灯效，或向一台设备应用单机模式；
 - 热插拔每秒刷新一次，拔出活动设备会停止管线；
 - Lua 插件在应用进程内分别使用独立 VM 和 worker。

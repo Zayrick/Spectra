@@ -152,6 +152,9 @@ impl PluginCatalog {
             }
         }
 
+        #[cfg(all(debug_assertions, not(test)))]
+        crate::virtual_device::append_discovered(&mut registered);
+
         registered.sort_by(|left, right| {
             (&left.name, &left.plugin.name, &left.id).cmp(&(
                 &right.name,

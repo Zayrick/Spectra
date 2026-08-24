@@ -1,0 +1,7 @@
+[package]
+name = "virtual_test_device"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mdns-sd = { version = "0.21.0", default-features = false }

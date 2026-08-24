@@ -62,7 +62,9 @@ impl DeviceSession {
             .required_function("enter_live")?
             .call::<()>(instance.clone())
             .with_context(|| format!("设备插件 {} 的 enter_live() 失败", self.plugin_name))?;
-        Ok(LiveDeviceSession { session: self })
+        Ok(LiveDeviceSession {
+            backend: LiveDeviceBackend::Plugin(self),
+        })
     }
 
     fn render_live(&self, colors: &ColorFrame) -> Result<()> {
@@ -115,28 +117,57 @@ impl Drop for DeviceSession {
 }
 
 pub(crate) struct LiveDeviceSession {
-    session: DeviceSession,
+    backend: LiveDeviceBackend,
+}
+
+enum LiveDeviceBackend {
+    Plugin(DeviceSession),
+    #[cfg(debug_assertions)]
+    Virtual(crate::virtual_device::LiveSession),
 }
 
 impl LiveDeviceSession {
     pub(crate) fn start(device: &RegisteredDevice, hid: &HidManager) -> Result<Self> {
+        #[cfg(debug_assertions)]
+        if let Some(session) = crate::virtual_device::LiveSession::open(device)? {
+            return Ok(Self {
+                backend: LiveDeviceBackend::Virtual(session),
+            });
+        }
+
         DeviceSession::open(device, hid)?.enter_live()
     }
 
-    pub(crate) fn render(&self, colors: &ColorFrame) -> Result<()> {
-        self.session.render_live(colors)
+    pub(crate) fn render(&mut self, colors: &ColorFrame) -> Result<()> {
+        match &mut self.backend {
+            LiveDeviceBackend::Plugin(session) => session.render_live(colors),
+            #[cfg(debug_assertions)]
+            LiveDeviceBackend::Virtual(session) => session.render(colors),
+        }
     }
 
     pub(crate) fn close(&mut self) -> Result<()> {
-        self.session.close()
+        match &mut self.backend {
+            LiveDeviceBackend::Plugin(session) => session.close(),
+            #[cfg(debug_assertions)]
+            LiveDeviceBackend::Virtual(session) => session.close(),
+        }
     }
 
     pub(crate) fn name(&self) -> &str {
-        &self.session.name
+        match &self.backend {
+            LiveDeviceBackend::Plugin(session) => &session.name,
+            #[cfg(debug_assertions)]
+            LiveDeviceBackend::Virtual(session) => session.name(),
+        }
     }
 
     pub(crate) fn matrix(&self) -> &DeviceMatrix {
-        &self.session.matrix
+        match &self.backend {
+            LiveDeviceBackend::Plugin(session) => &session.matrix,
+            #[cfg(debug_assertions)]
+            LiveDeviceBackend::Virtual(session) => session.matrix(),
+        }
     }
 }
 
@@ -294,7 +325,11 @@ return plugin
         live.close().unwrap();
 
         assert_eq!(
-            calls(&live.session),
+            calls(match &live.backend {
+                LiveDeviceBackend::Plugin(session) => session,
+                #[cfg(debug_assertions)]
+                LiveDeviceBackend::Virtual(_) => unreachable!(),
+            }),
             ["open", "enter_live", "render", "close"]
         );
     }

@@ -21,7 +21,7 @@ struct Arguments {
     #[arg(long)]
     list_plugins: bool,
 
-    /// 运行被 @hid 触发的 device 插件并列出其注册设备
+    /// 枚举并列出当前发现的设备
     #[arg(long)]
     list_devices: bool,
 }
@@ -39,7 +39,7 @@ fn main() -> Result<()> {
         let all_devices = hid.enumerate()?;
         let registered = catalog.discover(&all_devices, &hid)?;
         if registered.is_empty() {
-            println!("没有设备插件注册设备。");
+            println!("没有发现设备。");
         } else {
             for (index, device) in registered.iter().enumerate() {
                 println!(
