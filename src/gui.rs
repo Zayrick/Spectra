@@ -86,7 +86,7 @@ pub fn run(catalog: PluginCatalog, hid: HidManager) -> iced::Result {
 
     iced::application(boot, App::update, App::view)
         .title("Spectra")
-        .theme(Theme::TokyoNightStorm)
+        .theme(Theme::Dark)
         .subscription(App::subscription)
         .window(main_window_settings())
         .centered()
