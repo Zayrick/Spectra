@@ -60,6 +60,7 @@ const DETAIL_PANEL_WIDTH: f32 = 280.0;
 const TITLE_BAR_HEIGHT: f32 = 42.0;
 const TITLE_BAR_LEADING_PADDING: f32 = 14.0;
 const MACOS_TITLE_BAR_LEADING_PADDING: f32 = 87.0;
+const CONFIGURATION_INSET: f32 = 5.0;
 #[cfg(target_os = "macos")]
 const MACOS_WINDOW_CONTROL_OFFSET: f64 = 5.0;
 #[cfg(not(target_os = "macos"))]
@@ -343,11 +344,11 @@ impl App {
                 WorkspacePane::Configuration => self.configuration_view(),
             })
         })
-        .spacing(1)
+        .spacing(0)
         .min_size(176)
         .on_resize(8, Message::WorkspaceResized);
 
-        column![title_bar(), rule::horizontal(1), workspace]
+        column![title_bar(), workspace]
             .spacing(0)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -401,17 +402,27 @@ impl App {
 
     fn configuration_view(&self) -> Element<'_, Message> {
         container(
-            column![
-                self.device_information_panel(),
-                rule::horizontal(1),
-                self.control_workspace(),
-            ]
-            .spacing(0)
+            container(
+                column![
+                    self.device_information_panel(),
+                    rule::horizontal(1),
+                    self.control_workspace(),
+                ]
+                .spacing(0)
+                .width(Length::Fill)
+                .height(Length::Fill),
+            )
             .width(Length::Fill)
-            .height(Length::Fill),
+            .height(Length::Fill)
+            .style(style::configuration_panel),
         )
         .width(Length::Fill)
         .height(Length::Fill)
+        .padding(
+            Padding::ZERO
+                .right(CONFIGURATION_INSET)
+                .bottom(CONFIGURATION_INSET),
+        )
         .style(style::workspace)
         .into()
     }
@@ -421,41 +432,39 @@ impl App {
             Some(device) => {
                 let serial = device.serial_number.as_deref().unwrap_or("未提供");
 
-                let identity = column![
-                    text("设备信息").size(11).style(text::secondary),
-                    text(&device.name).size(27),
-                    text(format!("S/N  {serial}"))
-                        .size(12)
-                        .style(text::secondary),
-                    text(format!("设备来源  {}", device.plugin.name))
-                        .size(12)
-                        .style(text::secondary),
-                ]
-                .spacing(4)
-                .width(Length::FillPortion(5));
+                let identity = container(
+                    column![
+                        text(&device.name).size(27),
+                        text(format!("S/N  {serial}"))
+                            .size(12)
+                            .style(text::secondary),
+                        text(format!("设备来源  {}", device.plugin.name))
+                            .size(12)
+                            .style(text::secondary),
+                    ]
+                    .spacing(4),
+                )
+                .width(Length::FillPortion(5))
+                .padding(Padding::ZERO.top(16));
 
                 row![identity, self.lighting_preview(device)]
                     .spacing(28)
                     .height(Length::Fill)
                     .into()
             }
-            None => column![
-                text("设备信息").size(11).style(text::secondary),
-                container(
-                    column![
-                        text("尚未选择设备").size(24),
-                        text("连接受支持的设备，或点击左侧列表中的设备开始配置")
-                            .size(13)
-                            .style(text::secondary),
-                    ]
-                    .spacing(7)
-                    .align_x(Horizontal::Center),
-                )
-                .center_x(Length::Fill)
-                .height(Length::Fill)
-                .align_y(Vertical::Center),
-            ]
-            .spacing(12)
+            None => container(
+                column![
+                    text("尚未选择设备").size(24),
+                    text("连接受支持的设备，或点击左侧列表中的设备开始配置")
+                        .size(13)
+                        .style(text::secondary),
+                ]
+                .spacing(7)
+                .align_x(Horizontal::Center),
+            )
+            .center_x(Length::Fill)
+            .height(Length::Fill)
+            .align_y(Vertical::Center)
             .into(),
         };
 

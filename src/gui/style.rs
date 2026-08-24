@@ -1,7 +1,9 @@
 #[cfg(not(target_os = "macos"))]
 use iced::widget::svg;
 use iced::widget::{button, container};
-use iced::{Background, Border, Theme};
+use iced::{Background, Border, Theme, border};
+
+const CONFIGURATION_RADIUS: f32 = 10.0;
 
 #[cfg(not(target_os = "macos"))]
 pub(super) fn window_control_icon(theme: &Theme, _status: svg::Status) -> svg::Style {
@@ -93,17 +95,57 @@ pub(super) fn sidebar(theme: &Theme) -> container::Style {
 }
 
 pub(super) fn workspace(theme: &Theme) -> container::Style {
-    container::Style::default().background(theme.extended_palette().background.base.color)
+    container::Style::default().background(theme.extended_palette().background.weakest.color)
+}
+
+pub(super) fn configuration_panel(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(
+            theme.extended_palette().background.base.color,
+        )),
+        border: Border {
+            radius: border::radius(CONFIGURATION_RADIUS),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
 }
 
 pub(super) fn device_info(theme: &Theme) -> container::Style {
-    container::Style::default().background(theme.extended_palette().background.base.color)
+    container::Style {
+        background: Some(Background::Color(
+            theme.extended_palette().background.base.color,
+        )),
+        border: Border {
+            radius: border::top(CONFIGURATION_RADIUS),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
 }
 
 pub(super) fn effect_list(theme: &Theme) -> container::Style {
-    container::Style::default().background(theme.extended_palette().background.base.color)
+    container::Style {
+        background: Some(Background::Color(
+            theme.extended_palette().background.base.color,
+        )),
+        border: Border {
+            radius: border::bottom_left(CONFIGURATION_RADIUS),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
 }
 
 pub(super) fn effect_detail(theme: &Theme) -> container::Style {
-    container::Style::default().background(theme.extended_palette().background.weakest.color)
+    container::Style {
+        background: Some(Background::Color(
+            theme.extended_palette().background.base.color,
+        )),
+        border: Border {
+            radius: border::bottom_right(CONFIGURATION_RADIUS),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
 }
