@@ -1320,10 +1320,10 @@ fn title_bar<'a>() -> Element<'a, Message> {
     .on_right_press(Message::ShowWindowMenu);
 
     let scan = container(
-        button(text("扫描设备").size(11))
+        button(text("扫描设备").size(12))
             .on_press(Message::Rescan)
-            .padding([6, 10])
-            .style(button::secondary),
+            .padding([5.35, 8.0])
+            .style(style::scan_button),
     )
     .height(Length::Fill)
     .padding([0, 8])

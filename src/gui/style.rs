@@ -26,6 +26,12 @@ pub(super) fn close_window_button(theme: &Theme, status: button::Status) -> butt
     }
 }
 
+pub(super) fn scan_button(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = button::secondary(theme, status);
+    style.border.radius = 8.0.into();
+    style
+}
+
 pub(super) fn selectable_button(
     theme: &Theme,
     status: button::Status,
