@@ -12,6 +12,10 @@ use crate::hid::HidManager;
 use crate::plugin::{PluginMetadata, RegisteredDevice};
 use crate::types::{ColorFrame, DeviceMatrix};
 
+mod registry;
+
+pub use registry::{LivePipelineFailure, LivePipelineRegistry};
+
 const EFFECT_INTERVAL: Duration = Duration::from_nanos(16_666_667);
 
 pub struct LivePipeline {
@@ -48,16 +52,12 @@ impl LivePipeline {
         }
     }
 
-    pub fn matches_device(&self, device: &RegisteredDevice) -> bool {
-        self.device.plugin_id == device.plugin.id && self.device.device_id == device.id
-    }
-
     pub fn device_name(&self) -> &str {
         &self.device.name
     }
 
-    pub fn effect_name(&self) -> &str {
-        self.effect.name()
+    pub fn effect_id(&self) -> &str {
+        self.effect.id()
     }
 
     pub fn current_frame(&self) -> Option<ColorFrame> {
@@ -72,7 +72,7 @@ impl Drop for LivePipeline {
 }
 
 struct EffectWorker {
-    name: String,
+    id: String,
     stopped: Arc<AtomicBool>,
     errors: Receiver<String>,
     thread: Option<JoinHandle<()>>,
@@ -85,6 +85,7 @@ impl EffectWorker {
         device: Arc<FrameMailbox>,
     ) -> Result<Self> {
         let name = metadata.name.clone();
+        let id = metadata.id.clone();
         let worker_name = name.clone();
         let metadata = metadata.clone();
         let stopped = Arc::new(AtomicBool::new(false));
@@ -103,7 +104,7 @@ impl EffectWorker {
             .context("创建灯效线程失败")?;
 
         Ok(Self {
-            name,
+            id,
             stopped,
             errors: error_receiver,
             thread: Some(thread),
@@ -136,8 +137,8 @@ impl EffectWorker {
         }
     }
 
-    fn name(&self) -> &str {
-        &self.name
+    fn id(&self) -> &str {
+        &self.id
     }
 }
 
@@ -196,8 +197,6 @@ fn run_effect(
 }
 
 struct LiveDeviceWorker {
-    plugin_id: String,
-    device_id: Vec<u8>,
     name: String,
     matrix: DeviceMatrix,
     shared: Arc<FrameMailbox>,
@@ -228,8 +227,6 @@ impl LiveDeviceWorker {
             .context("创建设备线程失败")?;
 
         Ok(Self {
-            plugin_id: registered.plugin.id.clone(),
-            device_id: registered.id.clone(),
             name,
             matrix,
             shared,

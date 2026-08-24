@@ -21,9 +21,18 @@ pub struct RegisteredDevice {
     pub data: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DeviceKey {
+    plugin_id: String,
+    device_id: Vec<u8>,
+}
+
 impl RegisteredDevice {
-    pub fn key(&self) -> (&str, &[u8]) {
-        (&self.plugin.id, &self.id)
+    pub fn key(&self) -> DeviceKey {
+        DeviceKey {
+            plugin_id: self.plugin.id.clone(),
+            device_id: self.id.clone(),
+        }
     }
 
     pub fn id_display(&self) -> String {

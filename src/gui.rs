@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(not(target_os = "macos"))]
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -13,16 +13,13 @@ use std::{
 use block2::RcBlock;
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{
-    button, canvas, column, container, mouse_area, pane_grid, row, rule, scrollable, slider, text,
+    button, column, container, mouse_area, pane_grid, row, rule, scrollable, slider, text,
 };
 #[cfg(not(target_os = "macos"))]
 use iced::widget::{svg, tooltip};
 #[cfg(target_os = "macos")]
 use iced::window::raw_window_handle::RawWindowHandle;
-use iced::{
-    Background, Border, Color, Element, Length, Padding, Point, Rectangle, Renderer, Size,
-    Subscription, Task, Theme, mouse, time, window,
-};
+use iced::{Element, Length, Padding, Size, Subscription, Task, Theme, time, window};
 #[cfg(target_os = "macos")]
 use objc2::rc::Retained;
 #[cfg(target_os = "macos")]
@@ -38,15 +35,19 @@ use objc2_foundation::{
 };
 
 use crate::device::apply_standalone_mode;
-use crate::engine::LivePipeline;
+use crate::engine::LivePipelineRegistry;
 use crate::hid::HidManager;
-use crate::plugin::{PluginCatalog, PluginMetadata, RegisteredDevice};
-use crate::types::{
-    ColorFrame, DeviceMatrix, DeviceMode, ModeComponent, ModeControl, ModeSettings, ModeValue,
-    RgbColor, SliderRange,
-};
+use crate::plugin::{DeviceKey, PluginCatalog, RegisteredDevice};
+use crate::types::{DeviceMode, ModeComponent, ModeControl, ModeValue, RgbColor, SliderRange};
 
 mod color_picker;
+mod device_page;
+mod model;
+mod preview;
+mod style;
+
+use device_page::{ControlPage, DevicePageState, control_page_available};
+use model::{DeviceOption, EffectOption, detect_devices};
 
 const HOTPLUG_INTERVAL: Duration = Duration::from_secs(1);
 const PREVIEW_INTERVAL: Duration = Duration::from_millis(50);
@@ -127,30 +128,14 @@ struct App {
     hid: HidManager,
     devices: Vec<DeviceOption>,
     effects: Vec<EffectOption>,
-    selected_device: Option<DeviceOption>,
-    selected_effect: Option<EffectOption>,
-    control_page: ControlPage,
-    selected_mode_id: Option<String>,
-    mode_settings: Option<ModeSettings>,
-    color_hex_drafts: HashMap<String, String>,
-    active_color_picker: Option<ActiveColorPicker>,
+    selected_device: Option<DeviceKey>,
+    device_pages: HashMap<DeviceKey, DevicePageState>,
     workspace: pane_grid::State<WorkspacePane>,
-    live_pipeline: Option<LivePipeline>,
-    mode_action_pending: bool,
+    live_pipelines: LivePipelineRegistry,
+    pending_mode_actions: HashSet<DeviceKey>,
     close_after_mode_action: Option<window::Id>,
     preview_enabled: bool,
     window_id: Option<window::Id>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ControlPage {
-    Live,
-    Standalone,
-}
-
-struct ActiveColorPicker {
-    control_id: String,
-    hue: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -161,20 +146,32 @@ enum WorkspacePane {
 
 #[derive(Clone, Debug)]
 enum Message {
-    DeviceSelected(DeviceOption),
-    ControlPageSelected(ControlPage),
-    ToggleEffect(EffectOption),
-    DeviceModeSelected(String),
+    DeviceSelected(DeviceKey),
+    ControlPageSelected {
+        device: DeviceKey,
+        page: ControlPage,
+    },
+    ToggleEffect {
+        device: DeviceKey,
+        effect: EffectOption,
+    },
+    DeviceModeSelected {
+        device: DeviceKey,
+        mode_id: String,
+    },
     ModeColorEvent {
+        device: DeviceKey,
         control_id: String,
         event: color_picker::Event,
     },
     ModeSliderChanged {
+        device: DeviceKey,
         control_id: String,
         value: i32,
     },
-    ApplyDeviceMode,
+    ApplyDeviceMode(DeviceKey),
     ModeActionFinished {
+        device: DeviceKey,
         device_name: String,
         mode_name: String,
         result: Result<(), String>,
@@ -198,7 +195,7 @@ enum Message {
 impl App {
     fn new(catalog: PluginCatalog, hid: HidManager) -> Self {
         let effects: Vec<_> = catalog.effects().cloned().map(EffectOption).collect();
-        let selected_effect = effects.first().cloned();
+        let default_effect_id = effects.first().map(|effect| effect.0.id.as_str());
 
         let devices = match detect_devices(&catalog, &hid) {
             Ok(devices) => devices,
@@ -207,7 +204,16 @@ impl App {
                 Vec::new()
             }
         };
-        let selected_device = devices.first().cloned();
+        let selected_device = devices.first().map(|device| device.0.key());
+        let device_pages = devices
+            .iter()
+            .map(|device| {
+                (
+                    device.0.key(),
+                    DevicePageState::new(&device.0.capabilities, default_effect_id),
+                )
+            })
+            .collect();
         let workspace = pane_grid::State::with_configuration(pane_grid::Configuration::Split {
             axis: pane_grid::Axis::Vertical,
             ratio: DEFAULT_SIDEBAR_RATIO,
@@ -215,53 +221,62 @@ impl App {
             b: Box::new(pane_grid::Configuration::Pane(WorkspacePane::Configuration)),
         });
 
-        let mut app = Self {
+        Self {
             catalog,
             hid,
             devices,
             effects,
             selected_device,
-            selected_effect,
-            control_page: ControlPage::Live,
-            selected_mode_id: None,
-            mode_settings: None,
-            color_hex_drafts: HashMap::new(),
-            active_color_picker: None,
+            device_pages,
             workspace,
-            live_pipeline: None,
-            mode_action_pending: false,
+            live_pipelines: LivePipelineRegistry::default(),
+            pending_mode_actions: HashSet::new(),
             close_after_mode_action: None,
             preview_enabled: true,
             window_id: None,
-        };
-        app.reset_device_controls();
-        app
+        }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::DeviceSelected(device) => self.select_device(device),
-            Message::ControlPageSelected(page) => self.select_control_page(page),
-            Message::ToggleEffect(effect) => self.toggle_effect(effect),
-            Message::DeviceModeSelected(mode_id) => self.select_device_mode(mode_id),
-            Message::ModeColorEvent { control_id, event } => {
-                self.update_color_control(&control_id, event);
+            Message::ControlPageSelected { device, page } => {
+                self.select_control_page(&device, page)
             }
-            Message::ModeSliderChanged { control_id, value } => {
+            Message::ToggleEffect { device, effect } => self.toggle_effect(&device, effect),
+            Message::DeviceModeSelected { device, mode_id } => {
+                self.select_device_mode(&device, mode_id)
+            }
+            Message::ModeColorEvent {
+                device,
+                control_id,
+                event,
+            } => {
+                if let Some(page) = self.device_pages.get_mut(&device) {
+                    page.update_color(&control_id, event);
+                }
+            }
+            Message::ModeSliderChanged {
+                device,
+                control_id,
+                value,
+            } => {
                 if let Some(ModeValue::Slider(current)) = self
-                    .mode_settings
-                    .as_mut()
+                    .device_pages
+                    .get_mut(&device)
+                    .and_then(|page| page.mode_settings.as_mut())
                     .and_then(|settings| settings.get_mut(&control_id))
                 {
                     *current = value;
                 }
             }
-            Message::ApplyDeviceMode => return self.apply_selected_mode(),
+            Message::ApplyDeviceMode(device) => return self.apply_selected_mode(&device),
             Message::ModeActionFinished {
+                device,
                 device_name,
                 mode_name,
                 result,
-            } => return self.finish_mode_action(&device_name, &mode_name, result),
+            } => return self.finish_mode_action(&device, &device_name, &mode_name, result),
             Message::TogglePreview => self.preview_enabled = !self.preview_enabled,
             Message::WorkspaceResized(event) => {
                 self.workspace.resize(event.split, event.ratio);
@@ -294,7 +309,7 @@ impl App {
             window::open_events().map(Message::WindowOpened),
             window::close_requests().map(Message::CloseRequested),
         ];
-        if self.live_pipeline.is_some() {
+        if !self.live_pipelines.is_empty() {
             let interval = if self.preview_enabled {
                 PREVIEW_INTERVAL
             } else {
@@ -310,14 +325,14 @@ impl App {
     }
 
     fn close_window(&mut self, window: Option<window::Id>) -> Task<Message> {
-        if self.mode_action_pending {
+        if !self.pending_mode_actions.is_empty() {
             self.close_after_mode_action = window.or(self.window_id);
             eprintln!("正在完成单机模式操作，HID 会话关闭后退出");
             return Task::none();
         }
         #[cfg(target_os = "macos")]
         remove_macos_window_observers();
-        let _ = self.stop_live_pipeline();
+        let _ = self.live_pipelines.stop_all();
         window.map(window::close).unwrap_or_else(Task::none)
     }
 
@@ -366,23 +381,21 @@ impl App {
             .width(Length::Fill)
             .height(Length::Fill)
             .padding([12, 12])
-            .style(sidebar_style)
+            .style(style::sidebar)
             .into()
     }
 
     fn device_button<'a>(&'a self, device: &'a DeviceOption) -> Element<'a, Message> {
-        let selected = self.selected_device.as_ref() == Some(device);
-        let running = self
-            .live_pipeline
-            .as_ref()
-            .is_some_and(|pipeline| pipeline.matches_device(&device.0));
+        let key = device.0.key();
+        let selected = self.selected_device.as_ref() == Some(&key);
+        let running = self.live_pipelines.is_running(&key);
         let content = text(&device.0.name).size(14).width(Length::Fill);
 
         button(content)
-            .on_press(Message::DeviceSelected(device.clone()))
+            .on_press(Message::DeviceSelected(key))
             .width(Length::Fill)
             .padding([11, 12])
-            .style(move |theme, status| selectable_button_style(theme, status, selected, running))
+            .style(move |theme, status| style::selectable_button(theme, status, selected, running))
             .into()
     }
 
@@ -399,13 +412,13 @@ impl App {
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(workspace_style)
+        .style(style::workspace)
         .into()
     }
 
     fn device_information_panel(&self) -> Element<'_, Message> {
-        let content: Element<'_, Message> = match &self.selected_device {
-            Some(DeviceOption(device)) => {
+        let content: Element<'_, Message> = match self.selected_device() {
+            Some(device) => {
                 let serial = device.serial_number.as_deref().unwrap_or("未提供");
 
                 let identity = column![
@@ -450,33 +463,20 @@ impl App {
             .width(Length::Fill)
             .height(Length::Fixed(DEVICE_INFO_HEIGHT))
             .padding([18, 24])
-            .style(device_info_style)
+            .style(style::device_info)
             .into()
     }
 
     fn lighting_preview<'a>(&'a self, device: &'a RegisteredDevice) -> Element<'a, Message> {
-        let frame = self.preview_enabled.then(|| {
-            self.live_pipeline
-                .as_ref()
-                .filter(|pipeline| pipeline.matches_device(device))
-                .and_then(LivePipeline::current_frame)
-        });
+        let frame = self
+            .preview_enabled
+            .then(|| self.live_pipelines.current_frame(&device.key()));
 
-        mouse_area(
-            canvas(LightingPreview {
-                matrix: &device.matrix,
-                frame: frame.flatten(),
-                enabled: self.preview_enabled,
-            })
-            .width(Length::FillPortion(4))
-            .height(Length::Fill),
-        )
-        .on_press(Message::TogglePreview)
-        .into()
+        preview::view(&device.matrix, frame.flatten(), self.preview_enabled)
     }
 
     fn control_workspace(&self) -> Element<'_, Message> {
-        let Some(DeviceOption(device)) = &self.selected_device else {
+        let Some(device) = self.selected_device() else {
             return container(
                 column![
                     text("没有可配置的设备").size(17),
@@ -490,34 +490,43 @@ impl App {
             .center(Length::Fill)
             .into();
         };
+        let key = device.key();
+        let Some(page) = self.device_pages.get(&key) else {
+            return container(text("设备页面状态无效"))
+                .center(Length::Fill)
+                .into();
+        };
 
         let live_available = device.capabilities.live;
         let standalone_available = !device.capabilities.modes.is_empty();
         let tabs = row![
             button(text("实时").size(13))
-                .on_press_maybe(
-                    live_available.then_some(Message::ControlPageSelected(ControlPage::Live))
-                )
+                .on_press_maybe(live_available.then_some(Message::ControlPageSelected {
+                    device: key.clone(),
+                    page: ControlPage::Live,
+                }))
                 .padding([8, 18])
                 .style(|theme, status| {
-                    selectable_button_style(
+                    style::selectable_button(
                         theme,
                         status,
-                        self.control_page == ControlPage::Live,
+                        page.control_page == ControlPage::Live,
                         false,
                     )
                 }),
             button(text("单机").size(13))
                 .on_press_maybe(
-                    standalone_available
-                        .then_some(Message::ControlPageSelected(ControlPage::Standalone))
+                    standalone_available.then_some(Message::ControlPageSelected {
+                        device: key.clone(),
+                        page: ControlPage::Standalone,
+                    })
                 )
                 .padding([8, 18])
                 .style(|theme, status| {
-                    selectable_button_style(
+                    style::selectable_button(
                         theme,
                         status,
-                        self.control_page == ControlPage::Standalone,
+                        page.control_page == ControlPage::Standalone,
                         false,
                     )
                 }),
@@ -525,7 +534,7 @@ impl App {
         .spacing(8)
         .padding([10, 20]);
 
-        let content = match self.control_page {
+        let content = match page.control_page {
             ControlPage::Live => self.effect_workspace(),
             ControlPage::Standalone => self.standalone_workspace(),
         };
@@ -575,31 +584,40 @@ impl App {
             .width(Length::Fill)
             .height(Length::Fill)
             .padding([16, 20])
-            .style(effect_list_style)
+            .style(style::effect_list)
             .into()
     }
 
     fn effect_button<'a>(&'a self, effect: &'a EffectOption) -> Element<'a, Message> {
-        let selected = self.selected_effect.as_ref() == Some(effect);
+        let Some(device) = self.selected_device.as_ref() else {
+            return button(text(effect.0.name.as_str())).into();
+        };
+        let selected = self
+            .device_pages
+            .get(device)
+            .and_then(|page| page.selected_effect_id.as_deref())
+            == Some(effect.0.id.as_str());
         let running = self.effect_is_running(effect);
-        let can_toggle = !self.mode_action_pending
+        let can_toggle = !self.pending_mode_actions.contains(device)
             && self
-                .selected_device
-                .as_ref()
-                .is_some_and(|device| device.0.capabilities.live);
+                .selected_device()
+                .is_some_and(|device| device.capabilities.live);
 
         let content = text(effect.0.name.as_str()).size(15).width(Length::Fill);
 
         button(content)
-            .on_press_maybe(can_toggle.then_some(Message::ToggleEffect(effect.clone())))
+            .on_press_maybe(can_toggle.then_some(Message::ToggleEffect {
+                device: device.clone(),
+                effect: effect.clone(),
+            }))
             .width(Length::Fill)
             .padding([13, 12])
-            .style(move |theme, status| selectable_button_style(theme, status, selected, running))
+            .style(move |theme, status| style::selectable_button(theme, status, selected, running))
             .into()
     }
 
     fn effect_detail_panel(&self) -> Element<'_, Message> {
-        let content: Element<'_, Message> = match &self.selected_effect {
+        let content: Element<'_, Message> = match self.selected_effect() {
             Some(effect) => {
                 let details = column![
                     text("模式详情").size(11).style(text::secondary),
@@ -636,31 +654,31 @@ impl App {
             .width(Length::Fixed(DETAIL_PANEL_WIDTH))
             .height(Length::Fill)
             .padding([17, 18])
-            .style(effect_detail_style)
+            .style(style::effect_detail)
             .into()
     }
 
     fn effect_is_running(&self, effect: &EffectOption) -> bool {
-        let Some(DeviceOption(device)) = &self.selected_device else {
+        let Some(device) = self.selected_device.as_ref() else {
             return false;
         };
-        self.live_pipeline.as_ref().is_some_and(|pipeline| {
-            pipeline.matches_device(device) && pipeline.effect_name() == effect.0.name
-        })
+        self.live_pipelines.effect_id(device) == Some(effect.0.id.as_str())
     }
 
-    fn toggle_effect(&mut self, effect: EffectOption) {
-        let already_running = self.effect_is_running(&effect);
-        self.selected_effect = Some(effect);
+    fn toggle_effect(&mut self, device: &DeviceKey, effect: EffectOption) {
+        let already_running = self.live_pipelines.effect_id(device) == Some(effect.0.id.as_str());
+        if let Some(page) = self.device_pages.get_mut(device) {
+            page.selected_effect_id = Some(effect.0.id.clone());
+        }
         if already_running {
-            self.stop_live();
+            self.stop_live(device);
         } else {
-            self.start_live();
+            self.start_live(device, &effect);
         }
     }
 
-    fn start_live(&mut self) {
-        let Some(DeviceOption(device)) = self.selected_device.clone() else {
+    fn start_live(&mut self, key: &DeviceKey, effect: &EffectOption) {
+        let Some(device) = self.device(key).cloned() else {
             eprintln!("没有可启动的设备");
             return;
         };
@@ -668,57 +686,35 @@ impl App {
             eprintln!("设备 {} 不支持实时控制", device.name);
             return;
         }
-        if self.mode_action_pending {
+        if self.pending_mode_actions.contains(key) {
             eprintln!("单机模式操作尚未完成");
             return;
         }
-        let Some(EffectOption(effect)) = self.selected_effect.clone() else {
-            eprintln!("没有可启动的灯效插件");
-            return;
-        };
 
-        if let Err(error) = self.stop_live_pipeline() {
-            eprintln!("关闭上一条实时管线失败：{error:#}");
-            return;
-        }
-
-        match LivePipeline::start(&device, &effect, &self.hid) {
-            Ok(pipeline) => {
+        match self.live_pipelines.start(&device, &effect.0, &self.hid) {
+            Ok(()) => {
                 eprintln!(
                     "已启动 {} + {}，灯效与设备均在独立 worker 中运行",
-                    pipeline.device_name(),
-                    pipeline.effect_name(),
+                    device.name, effect.0.name,
                 );
-                self.live_pipeline = Some(pipeline);
             }
             Err(error) => eprintln!("启动失败：{error:#}"),
         }
     }
 
-    fn stop_live(&mut self) {
-        match self.stop_live_pipeline() {
-            Ok(()) => eprintln!("实时灯效已停止，设备会话已关闭"),
+    fn stop_live(&mut self, device: &DeviceKey) {
+        match self.live_pipelines.stop(device) {
+            Ok(()) => eprintln!("该设备的实时灯效已停止，设备会话已关闭"),
             Err(error) => eprintln!("停止失败：{error:#}"),
         }
     }
 
     fn poll_live_pipeline(&mut self) {
-        let result = self.live_pipeline.as_ref().map(LivePipeline::poll);
-        if let Some(Err(error)) = result {
-            let stop_error = self.stop_live_pipeline().err();
-            match stop_error {
-                Some(stop_error) => {
-                    eprintln!("渲染管线已停止：{error:#}；关闭时又发生错误：{stop_error:#}")
-                }
-                None => eprintln!("渲染管线已停止：{error:#}"),
-            }
-        }
-    }
-
-    fn stop_live_pipeline(&mut self) -> anyhow::Result<()> {
-        match self.live_pipeline.take() {
-            Some(mut pipeline) => pipeline.stop(),
-            None => Ok(()),
+        for failure in self.live_pipelines.poll() {
+            eprintln!(
+                "设备 {} 的渲染管线已停止：{:#}",
+                failure.device_name, failure.error
+            );
         }
     }
 
@@ -735,8 +731,8 @@ impl App {
     }
 
     fn device_mode_list_panel(&self) -> Element<'_, Message> {
-        let list: Element<'_, Message> = match &self.selected_device {
-            Some(DeviceOption(device)) if !device.capabilities.modes.is_empty() => {
+        let list: Element<'_, Message> = match self.selected_device() {
+            Some(device) if !device.capabilities.modes.is_empty() => {
                 let mut items = column![].spacing(8).width(Length::Fill);
                 for mode in &device.capabilities.modes {
                     items = items.push(self.device_mode_button(mode));
@@ -761,17 +757,27 @@ impl App {
             .width(Length::Fill)
             .height(Length::Fill)
             .padding([16, 20])
-            .style(effect_list_style)
+            .style(style::effect_list)
             .into()
     }
 
     fn device_mode_button<'a>(&'a self, mode: &'a DeviceMode) -> Element<'a, Message> {
-        let selected = self.selected_mode_id.as_deref() == Some(mode.id.as_str());
+        let Some(device) = self.selected_device.as_ref() else {
+            return button(text(mode.name.as_str())).into();
+        };
+        let selected = self
+            .device_pages
+            .get(device)
+            .and_then(|page| page.selected_mode_id.as_deref())
+            == Some(mode.id.as_str());
         button(text(mode.name.as_str()).size(15).width(Length::Fill))
-            .on_press(Message::DeviceModeSelected(mode.id.clone()))
+            .on_press(Message::DeviceModeSelected {
+                device: device.clone(),
+                mode_id: mode.id.clone(),
+            })
             .width(Length::Fill)
             .padding([13, 12])
-            .style(move |theme, status| selectable_button_style(theme, status, selected, false))
+            .style(move |theme, status| style::selectable_button(theme, status, selected, false))
             .into()
     }
 
@@ -787,15 +793,18 @@ impl App {
             .width(Length::Fixed(DETAIL_PANEL_WIDTH))
             .height(Length::Fill)
             .padding([17, 18])
-            .style(effect_detail_style)
+            .style(style::effect_detail)
             .into();
         };
-        let Some(settings) = &self.mode_settings else {
+        let Some(page) = self.selected_page() else {
+            return container(text("设备页面状态无效")).into();
+        };
+        let Some(settings) = &page.mode_settings else {
             return container(text("模式参数状态无效"))
                 .width(Length::Fixed(DETAIL_PANEL_WIDTH))
                 .height(Length::Fill)
                 .padding([17, 18])
-                .style(effect_detail_style)
+                .style(style::effect_detail)
                 .into();
         };
 
@@ -824,10 +833,11 @@ impl App {
             }
         }
 
-        let available = !self.mode_action_pending;
+        let device = self.selected_device.as_ref().expect("已选择设备");
+        let available = !self.pending_mode_actions.contains(device);
         let actions = row![
             button(text("应用").size(12))
-                .on_press_maybe(available.then_some(Message::ApplyDeviceMode))
+                .on_press_maybe(available.then_some(Message::ApplyDeviceMode(device.clone())))
                 .padding([8, 14])
                 .style(button::primary),
         ]
@@ -841,7 +851,7 @@ impl App {
             .width(Length::Fixed(DETAIL_PANEL_WIDTH))
             .height(Length::Fill)
             .padding([17, 18])
-            .style(effect_detail_style)
+            .style(style::effect_detail)
             .into()
     }
 
@@ -870,12 +880,19 @@ impl App {
     }
 
     fn color_control<'a>(&self, control_id: &str, color: RgbColor) -> Element<'a, Message> {
-        let hex = self
+        let Some(device) = self.selected_device.as_ref() else {
+            return text("没有选择设备").into();
+        };
+        let device = device.clone();
+        let Some(page) = self.device_pages.get(&device) else {
+            return text("设备页面状态无效").into();
+        };
+        let hex = page
             .color_hex_drafts
             .get(control_id)
             .cloned()
             .unwrap_or_else(|| color_picker::format_hex(color));
-        let active = self
+        let active = page
             .active_color_picker
             .as_ref()
             .filter(|picker| picker.control_id == control_id);
@@ -885,106 +902,10 @@ impl App {
         let control_id = control_id.to_owned();
 
         color_picker::view(color, &hex, hue, open).map(move |event| Message::ModeColorEvent {
+            device: device.clone(),
             control_id: control_id.clone(),
             event,
         })
-    }
-
-    fn update_color_control(&mut self, control_id: &str, event: color_picker::Event) {
-        match event {
-            color_picker::Event::Toggle => {
-                if self
-                    .active_color_picker
-                    .as_ref()
-                    .is_some_and(|picker| picker.control_id == control_id)
-                {
-                    self.active_color_picker = None;
-                } else if let Some(color) = self.mode_color(control_id) {
-                    let (hue, _, _) = color_picker::rgb_to_hsv(color);
-                    self.active_color_picker = Some(ActiveColorPicker {
-                        control_id: control_id.to_owned(),
-                        hue,
-                    });
-                }
-            }
-            color_picker::Event::Dismiss => {
-                if self
-                    .active_color_picker
-                    .as_ref()
-                    .is_some_and(|picker| picker.control_id == control_id)
-                {
-                    self.active_color_picker = None;
-                }
-            }
-            color_picker::Event::HexChanged(input) => {
-                let Some(input) = color_picker::normalize_hex_input(&input) else {
-                    return;
-                };
-                if let Some(color) = color_picker::parse_hex(&input) {
-                    if let Some(picker) = self
-                        .active_color_picker
-                        .as_mut()
-                        .filter(|picker| picker.control_id == control_id)
-                    {
-                        let (hue, saturation, _) = color_picker::rgb_to_hsv(color);
-                        if saturation > 0.0 {
-                            picker.hue = hue;
-                        }
-                    }
-                    self.set_mode_color(control_id, color);
-                } else {
-                    self.color_hex_drafts.insert(control_id.to_owned(), input);
-                }
-            }
-            color_picker::Event::SaturationValueChanged { saturation, value } => {
-                let Some(current) = self.mode_color(control_id) else {
-                    return;
-                };
-                let hue = self
-                    .active_color_picker
-                    .as_ref()
-                    .filter(|picker| picker.control_id == control_id)
-                    .map_or_else(|| color_picker::rgb_to_hsv(current).0, |picker| picker.hue);
-                self.set_mode_color(control_id, color_picker::hsv_to_rgb(hue, saturation, value));
-            }
-            color_picker::Event::HueChanged(hue) => {
-                let Some(current) = self.mode_color(control_id) else {
-                    return;
-                };
-                if let Some(picker) = self
-                    .active_color_picker
-                    .as_mut()
-                    .filter(|picker| picker.control_id == control_id)
-                {
-                    picker.hue = hue;
-                }
-                let (_, saturation, value) = color_picker::rgb_to_hsv(current);
-                self.set_mode_color(control_id, color_picker::hsv_to_rgb(hue, saturation, value));
-            }
-        }
-    }
-
-    fn mode_color(&self, control_id: &str) -> Option<RgbColor> {
-        match self.mode_settings.as_ref()?.get(control_id)? {
-            ModeValue::Color(color) => Some(*color),
-            ModeValue::Slider(_) => None,
-        }
-    }
-
-    fn set_mode_color(&mut self, control_id: &str, color: RgbColor) {
-        if let Some(ModeValue::Color(current)) = self
-            .mode_settings
-            .as_mut()
-            .and_then(|settings| settings.get_mut(control_id))
-        {
-            *current = color;
-            self.color_hex_drafts.remove(control_id);
-        }
-    }
-
-    fn reset_color_editor(&mut self) {
-        self.active_color_picker = None;
-        self.color_hex_drafts.clear();
     }
 
     fn slider_control<'a>(
@@ -993,6 +914,9 @@ impl App {
         range: SliderRange,
         value: i32,
     ) -> Element<'a, Message> {
+        let Some(device) = self.selected_device.clone() else {
+            return text("没有选择设备").into();
+        };
         let control_id = control_id.to_owned();
         column![
             row![
@@ -1004,6 +928,7 @@ impl App {
             ],
             slider(range.min..=range.max, value, move |value| {
                 Message::ModeSliderChanged {
+                    device: device.clone(),
                     control_id: control_id.clone(),
                     value,
                 }
@@ -1013,75 +938,77 @@ impl App {
         .into()
     }
 
-    fn select_device(&mut self, device: DeviceOption) {
-        self.selected_device = Some(device);
-        self.reset_device_controls();
+    fn device(&self, key: &DeviceKey) -> Option<&RegisteredDevice> {
+        self.devices
+            .iter()
+            .find(|device| device.0.key() == *key)
+            .map(|device| &device.0)
     }
 
-    fn select_control_page(&mut self, page: ControlPage) {
-        let available = self
-            .selected_device
-            .as_ref()
-            .is_some_and(|device| match page {
-                ControlPage::Live => device.0.capabilities.live,
-                ControlPage::Standalone => !device.0.capabilities.modes.is_empty(),
-            });
-        if available {
-            self.control_page = page;
+    fn selected_device(&self) -> Option<&RegisteredDevice> {
+        self.device(self.selected_device.as_ref()?)
+    }
+
+    fn selected_page(&self) -> Option<&DevicePageState> {
+        self.device_pages.get(self.selected_device.as_ref()?)
+    }
+
+    fn selected_effect(&self) -> Option<&EffectOption> {
+        let effect_id = self.selected_page()?.selected_effect_id.as_deref()?;
+        self.effects.iter().find(|effect| effect.0.id == effect_id)
+    }
+
+    fn select_device(&mut self, device: DeviceKey) {
+        if self.device_pages.contains_key(&device) {
+            self.selected_device = Some(device);
         }
     }
 
-    fn select_device_mode(&mut self, mode_id: String) {
+    fn select_control_page(&mut self, device: &DeviceKey, page: ControlPage) {
+        let available = self
+            .device(device)
+            .is_some_and(|device| control_page_available(&device.capabilities, page));
+        if available && let Some(state) = self.device_pages.get_mut(device) {
+            state.control_page = page;
+        }
+    }
+
+    fn select_device_mode(&mut self, device: &DeviceKey, mode_id: String) {
         let settings = self
-            .selected_device
-            .as_ref()
-            .and_then(|device| device.0.capabilities.mode(&mode_id))
+            .device(device)
+            .and_then(|device| device.capabilities.mode(&mode_id))
             .map(DeviceMode::default_settings);
-        if let Some(settings) = settings {
-            self.selected_mode_id = Some(mode_id);
-            self.mode_settings = Some(settings);
-            self.reset_color_editor();
+        if let Some(settings) = settings
+            && let Some(page) = self.device_pages.get_mut(device)
+        {
+            page.selected_mode_id = Some(mode_id);
+            page.mode_settings = Some(settings);
+            page.reset_color_editor();
         }
     }
 
     fn selected_mode(&self) -> Option<&DeviceMode> {
-        let mode_id = self.selected_mode_id.as_deref()?;
-        self.selected_device.as_ref()?.0.capabilities.mode(mode_id)
+        let mode_id = self.selected_page()?.selected_mode_id.as_deref()?;
+        self.selected_device()?.capabilities.mode(mode_id)
     }
 
-    fn reset_device_controls(&mut self) {
-        let Some(DeviceOption(device)) = &self.selected_device else {
-            self.control_page = ControlPage::Live;
-            self.selected_mode_id = None;
-            self.mode_settings = None;
-            self.reset_color_editor();
-            return;
-        };
-
-        self.control_page = if device.capabilities.live {
-            ControlPage::Live
-        } else {
-            ControlPage::Standalone
-        };
-        let mode = device.capabilities.modes.first();
-        self.selected_mode_id = mode.map(|mode| mode.id.clone());
-        self.mode_settings = mode.map(DeviceMode::default_settings);
-        self.reset_color_editor();
-    }
-
-    fn apply_selected_mode(&mut self) -> Task<Message> {
-        if self.mode_action_pending {
+    fn apply_selected_mode(&mut self, key: &DeviceKey) -> Task<Message> {
+        if self.pending_mode_actions.contains(key) {
             return Task::none();
         }
-        let Some(DeviceOption(device)) = self.selected_device.clone() else {
+        let Some(device) = self.device(key).cloned() else {
             eprintln!("没有可配置的设备");
             return Task::none();
         };
-        let Some(mode_id) = self.selected_mode_id.clone() else {
+        let Some(page) = self.device_pages.get(key) else {
+            eprintln!("设备页面状态无效");
+            return Task::none();
+        };
+        let Some(mode_id) = page.selected_mode_id.clone() else {
             eprintln!("没有可应用的单机模式");
             return Task::none();
         };
-        let Some(settings) = self.mode_settings.clone() else {
+        let Some(settings) = page.mode_settings.clone() else {
             eprintln!("单机模式参数无效");
             return Task::none();
         };
@@ -1096,12 +1023,13 @@ impl App {
         let mode_name = mode.name.clone();
         let device_name = device.name.clone();
 
-        if let Err(error) = self.stop_live_pipeline() {
-            eprintln!("停止实时管线失败，未应用单机模式：{error:#}");
+        if let Err(error) = self.live_pipelines.stop(key) {
+            eprintln!("停止该设备的实时管线失败，未应用单机模式：{error:#}");
             return Task::none();
         }
 
-        self.mode_action_pending = true;
+        self.pending_mode_actions.insert(key.clone());
+        let task_device = key.clone();
         let hid = self.hid.clone();
         Task::perform(
             async move {
@@ -1109,6 +1037,7 @@ impl App {
                     .map_err(|error| format!("{error:#}"))
             },
             move |result| Message::ModeActionFinished {
+                device: task_device.clone(),
                 device_name: device_name.clone(),
                 mode_name: mode_name.clone(),
                 result,
@@ -1118,23 +1047,28 @@ impl App {
 
     fn finish_mode_action(
         &mut self,
+        device: &DeviceKey,
         device_name: &str,
         mode_name: &str,
         result: Result<(), String>,
     ) -> Task<Message> {
-        self.mode_action_pending = false;
+        self.pending_mode_actions.remove(device);
         match result {
             Ok(()) => eprintln!("已向 {device_name} 应用单机模式 {mode_name}"),
             Err(error) => eprintln!("配置 {device_name} 的单机模式失败：{error}"),
         }
-        match self.close_after_mode_action.take() {
-            Some(window) => self.close_window(Some(window)),
-            None => Task::none(),
+        if self.pending_mode_actions.is_empty() {
+            match self.close_after_mode_action.take() {
+                Some(window) => self.close_window(Some(window)),
+                None => Task::none(),
+            }
+        } else {
+            Task::none()
         }
     }
 
     fn rescan(&mut self, manual: bool) {
-        if self.mode_action_pending {
+        if !self.pending_mode_actions.is_empty() {
             if manual {
                 eprintln!("单机模式操作完成后才能重新扫描设备");
             }
@@ -1148,28 +1082,18 @@ impl App {
             }
         };
         let changed = self.devices != devices;
-        let disconnected = self.live_pipeline.as_ref().is_some_and(|pipeline| {
-            !devices
-                .iter()
-                .any(|DeviceOption(device)| pipeline.matches_device(device))
-        });
+        let connected = devices.iter().map(|device| device.0.key());
+        let disconnected = self.live_pipelines.retain_devices(connected);
 
         self.replace_devices(devices);
 
-        if disconnected {
-            let name = self
-                .live_pipeline
-                .as_ref()
-                .map(|pipeline| pipeline.device_name().to_owned())
-                .unwrap_or_default();
-            let stop_error = self.stop_live_pipeline().err();
-            match stop_error {
-                Some(error) => {
-                    eprintln!("设备 {name} 已拔出；停止管线时发生错误：{error:#}")
-                }
-                None => eprintln!("设备 {name} 已拔出，灯效管线已停止"),
-            }
-        } else if manual {
+        for failure in disconnected {
+            eprintln!(
+                "设备 {} 已拔出，灯效管线已停止：{:#}",
+                failure.device_name, failure.error
+            );
+        }
+        if manual {
             eprintln!("重新扫描完成：找到 {} 个支持项", self.devices.len());
         } else if changed {
             eprintln!("设备列表已更新：找到 {} 个支持项", self.devices.len());
@@ -1177,47 +1101,23 @@ impl App {
     }
 
     fn replace_devices(&mut self, devices: Vec<DeviceOption>) {
-        let previous_key = self
-            .selected_device
-            .as_ref()
-            .map(|device| (device.0.plugin.id.clone(), device.0.id.clone()));
-        let previous_capabilities = self
-            .selected_device
-            .as_ref()
-            .map(|device| device.0.capabilities.clone());
-        let previous = self.selected_device.take();
-        self.selected_device = previous
-            .and_then(|selected| devices.iter().find(|device| **device == selected).cloned())
-            .or_else(|| devices.first().cloned());
-        self.devices = devices;
-
-        let current_key = self
-            .selected_device
-            .as_ref()
-            .map(|device| (device.0.plugin.id.clone(), device.0.id.clone()));
-        let current_capabilities = self
-            .selected_device
-            .as_ref()
-            .map(|device| &device.0.capabilities);
-        let control_valid =
-            self.selected_device
-                .as_ref()
-                .is_some_and(|device| match self.control_page {
-                    ControlPage::Live => device.0.capabilities.live,
-                    ControlPage::Standalone => !device.0.capabilities.modes.is_empty(),
-                });
-        let mode_valid = self.selected_mode_id.as_deref().is_none_or(|mode_id| {
-            self.selected_device
-                .as_ref()
-                .is_some_and(|device| device.0.capabilities.mode(mode_id).is_some())
-        });
-        if previous_key != current_key
-            || previous_capabilities.as_ref() != current_capabilities
-            || !control_valid
-            || !mode_valid
-        {
-            self.reset_device_controls();
+        let default_effect_id = self.effects.first().map(|effect| effect.0.id.as_str());
+        let connected: HashSet<_> = devices.iter().map(|device| device.0.key()).collect();
+        self.device_pages.retain(|key, _| connected.contains(key));
+        for device in &devices {
+            self.device_pages
+                .entry(device.0.key())
+                .and_modify(|page| page.reconcile(&device.0.capabilities, default_effect_id))
+                .or_insert_with(|| DevicePageState::new(&device.0.capabilities, default_effect_id));
         }
+        if self
+            .selected_device
+            .as_ref()
+            .is_none_or(|key| !connected.contains(key))
+        {
+            self.selected_device = devices.first().map(|device| device.0.key());
+        }
+        self.devices = devices;
     }
 }
 
@@ -1437,19 +1337,19 @@ fn title_bar<'a>() -> Element<'a, Message> {
                 &MINIMIZE_ICON,
                 "最小化",
                 Message::MinimizeWindow,
-                title_bar_button_style,
+                style::title_bar_button,
             ),
             window_control_button(
                 &MAXIMIZE_ICON,
                 "最大化或还原",
                 Message::ToggleMaximize,
-                title_bar_button_style,
+                style::title_bar_button,
             ),
             window_control_button(
                 &CLOSE_ICON,
                 "关闭",
                 Message::CloseWindow,
-                close_window_button_style,
+                style::close_window_button,
             ),
         ]
         .height(Length::Fixed(TITLE_BAR_HEIGHT)),
@@ -1463,7 +1363,7 @@ fn title_bar<'a>() -> Element<'a, Message> {
     )
     .width(Length::Fill)
     .height(Length::Fixed(TITLE_BAR_HEIGHT))
-    .style(title_bar_style)
+    .style(style::title_bar)
     .into()
 }
 
@@ -1478,7 +1378,7 @@ fn window_control_button<'a>(
         svg(icon.clone())
             .width(Length::Fixed(WINDOW_CONTROL_ICON_SIZE))
             .height(Length::Fixed(WINDOW_CONTROL_ICON_SIZE))
-            .style(window_control_icon_style),
+            .style(style::window_control_icon),
     )
     .center(Length::Fill);
     let control = button(icon)
@@ -1511,198 +1411,3 @@ fn metadata_row<'a>(label: &'a str, value: &'a str) -> Element<'a, Message> {
     .align_y(Vertical::Center)
     .into()
 }
-
-struct LightingPreview<'a> {
-    matrix: &'a DeviceMatrix,
-    frame: Option<ColorFrame>,
-    enabled: bool,
-}
-
-impl canvas::Program<Message> for LightingPreview<'_> {
-    type State = ();
-
-    fn draw(
-        &self,
-        _state: &Self::State,
-        renderer: &Renderer,
-        theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<canvas::Geometry> {
-        if !self.enabled {
-            return Vec::new();
-        }
-
-        let palette = theme.extended_palette();
-        let mut drawing = canvas::Frame::new(renderer, bounds.size());
-
-        let cell_size = (bounds.width / f32::from(self.matrix.width))
-            .min(bounds.height / f32::from(self.matrix.height));
-        if cell_size <= 0.0 {
-            return vec![drawing.into_geometry()];
-        }
-
-        let grid_width = cell_size * f32::from(self.matrix.width);
-        let grid_height = cell_size * f32::from(self.matrix.height);
-        let origin = Point::new(
-            (bounds.width - grid_width) / 2.0,
-            (bounds.height - grid_height) / 2.0,
-        );
-        let gap = (cell_size * 0.18).clamp(1.0, 3.5);
-        let led_size = Size::new((cell_size - gap).max(1.0), (cell_size - gap).max(1.0));
-        let radius = (led_size.width * 0.24).clamp(1.0, 4.0);
-        let inactive = palette.background.strong.color;
-        let outline = palette.background.base.text.scale_alpha(0.18);
-        let mut colors = self.frame.as_deref().unwrap_or_default().chunks_exact(3);
-
-        for led in &self.matrix.leds {
-            let color = colors
-                .next()
-                .map(|rgb| Color::from_rgb8(rgb[0], rgb[1], rgb[2]))
-                .unwrap_or(inactive);
-            let position = Point::new(
-                origin.x + f32::from(led.x) * cell_size + gap / 2.0,
-                origin.y + f32::from(led.y) * cell_size + gap / 2.0,
-            );
-            let light = canvas::Path::rounded_rectangle(position, led_size, radius.into());
-            drawing.fill(&light, color);
-            drawing.stroke(
-                &light,
-                canvas::Stroke::default()
-                    .with_color(outline)
-                    .with_width(0.75),
-            );
-        }
-
-        vec![drawing.into_geometry()]
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn window_control_icon_style(theme: &Theme, _status: svg::Status) -> svg::Style {
-    svg::Style {
-        color: Some(theme.extended_palette().background.base.text),
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn title_bar_button_style(theme: &Theme, status: button::Status) -> button::Style {
-    match status {
-        button::Status::Hovered | button::Status::Pressed => button::background(theme, status),
-        button::Status::Active | button::Status::Disabled => button::text(theme, status),
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn close_window_button_style(theme: &Theme, status: button::Status) -> button::Style {
-    match status {
-        button::Status::Hovered | button::Status::Pressed => button::danger(theme, status),
-        button::Status::Active | button::Status::Disabled => button::text(theme, status),
-    }
-}
-
-fn selectable_button_style(
-    theme: &Theme,
-    status: button::Status,
-    selected: bool,
-    running: bool,
-) -> button::Style {
-    let palette = theme.extended_palette();
-    let base = if running {
-        palette.success.weak
-    } else if selected {
-        palette.primary.weak
-    } else {
-        palette.background.weakest
-    };
-    let (background, text_color) = match status {
-        button::Status::Hovered => {
-            let pair = if running {
-                palette.success.base
-            } else if selected {
-                palette.primary.base
-            } else {
-                palette.background.weak
-            };
-            (pair.color, pair.text)
-        }
-        button::Status::Pressed => (
-            palette.background.strong.color,
-            palette.background.strong.text,
-        ),
-        button::Status::Disabled => (base.color.scale_alpha(0.45), base.text.scale_alpha(0.55)),
-        button::Status::Active => (base.color, base.text),
-    };
-    let border_color = if running {
-        palette.success.base.color
-    } else if selected {
-        palette.primary.base.color
-    } else {
-        palette.background.weak.color
-    };
-
-    button::Style {
-        background: Some(Background::Color(background)),
-        text_color,
-        border: Border {
-            color: border_color,
-            width: if selected || running { 1.0 } else { 0.0 },
-            radius: 9.0.into(),
-        },
-        ..button::Style::default()
-    }
-}
-
-fn title_bar_style(theme: &Theme) -> container::Style {
-    container::Style::default().background(theme.extended_palette().background.weakest.color)
-}
-
-fn sidebar_style(theme: &Theme) -> container::Style {
-    container::Style::default().background(theme.extended_palette().background.weakest.color)
-}
-
-fn workspace_style(theme: &Theme) -> container::Style {
-    container::Style::default().background(theme.extended_palette().background.base.color)
-}
-
-fn device_info_style(theme: &Theme) -> container::Style {
-    container::Style::default().background(theme.extended_palette().background.base.color)
-}
-
-fn effect_list_style(theme: &Theme) -> container::Style {
-    container::Style::default().background(theme.extended_palette().background.base.color)
-}
-
-fn effect_detail_style(theme: &Theme) -> container::Style {
-    container::Style::default().background(theme.extended_palette().background.weakest.color)
-}
-
-fn detect_devices(catalog: &PluginCatalog, hid: &HidManager) -> anyhow::Result<Vec<DeviceOption>> {
-    Ok(catalog
-        .discover(&hid.enumerate()?, hid)?
-        .into_iter()
-        .map(DeviceOption)
-        .collect())
-}
-
-#[derive(Clone, Debug)]
-struct DeviceOption(RegisteredDevice);
-
-impl PartialEq for DeviceOption {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.key() == other.0.key()
-    }
-}
-
-impl Eq for DeviceOption {}
-
-#[derive(Clone, Debug)]
-struct EffectOption(PluginMetadata);
-
-impl PartialEq for EffectOption {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.id == other.0.id
-    }
-}
-
-impl Eq for EffectOption {}
