@@ -44,7 +44,9 @@ impl LivePipelineRegistry {
         hid: &HidManager,
     ) -> Result<()> {
         let key = device.key();
-        self.stop(&key)?;
+        if let Some(pipeline) = self.pipelines.get_mut(&key) {
+            return pipeline.switch(effect);
+        }
         let pipeline = LivePipeline::start(device, effect, hid)?;
         self.pipelines.insert(key, pipeline);
         Ok(())
